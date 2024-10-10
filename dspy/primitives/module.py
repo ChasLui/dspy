@@ -1,4 +1,5 @@
 import copy
+import logging
 from collections import deque
 from collections.abc import Generator
 
@@ -102,38 +103,66 @@ class BaseModule:
         return [param for _, param in self.named_parameters()]
 
     def deepcopy(self):
-        return copy.deepcopy(self)
+        """Deep copy the module.
+
+        This is a tweak to the default python deepcopy that only deep copies `self.parameters()`, and for other
+        attributes, we just do the shallow copy.
+        """
+        try:
+            # If the instance itself is copyable, we can just deep copy it.
+            # Otherwise we will have to create a new instance and copy over the attributes one by one.
+            return copy.deepcopy(self)
+        except Exception:
+            pass
+
+        # Create an empty instance.
+        new_instance = self.__class__.__new__(self.__class__)
+        # Set attribuetes of the copied instance.
+        for attr, value in self.__dict__.items():
+            if isinstance(value, BaseModule):
+                setattr(new_instance, attr, value.deepcopy())
+            else:
+                try:
+                    # Try to deep copy the attribute
+                    setattr(new_instance, attr, copy.deepcopy(value))
+                except Exception:
+                    logging.warning(
+                        f"Failed to deep copy attribute '{attr}' of {self.__class__.__name__}, "
+                        "falling back to shallow copy or reference copy."
+                    )
+                    try:
+                        # Fallback to shallow copy if deep copy fails
+                        setattr(new_instance, attr, copy.copy(value))
+                    except Exception:
+                        # If even the shallow copy fails, we just copy over the reference.
+                        setattr(new_instance, attr, value)
+
+        return new_instance
 
     def reset_copy(self):
-        obj = copy.deepcopy(self)
+        """Deep copy the module and reset all parameters."""
+        new_instance = self.deepcopy()
 
-        for param in obj.parameters():
+        for param in new_instance.parameters():
             param.reset()
 
-        return obj
+        return new_instance
 
     def dump_state(self, save_verbose):
         print(self.named_parameters())
         return {name: param.dump_state(save_verbose) for name, param in self.named_parameters()}
 
-    def load_state(self, state):
+    def load_state(self, state, use_legacy_loading=False):
         for name, param in self.named_parameters():
-            param.load_state(state[name])
-            # try:
-            #     param.load_state(state[name])
-            # except KeyError:
-            #     if name.endswith("._predict"):
-            #         param.load_state(state[name[:-9]])
-            #     else:
-            #         raise
+            param.load_state(state[name], use_legacy_loading=use_legacy_loading)
 
     def save(self, path, save_field_meta=False):
         with open(path, "w") as f:
             f.write(ujson.dumps(self.dump_state(save_field_meta), indent=2))
 
-    def load(self, path):
+    def load(self, path, use_legacy_loading=False):
         with open(path) as f:
-            self.load_state(ujson.loads(f.read()))
+            self.load_state(ujson.loads(f.read()), use_legacy_loading=use_legacy_loading)
 
 
 def postprocess_parameter_name(name, value):
