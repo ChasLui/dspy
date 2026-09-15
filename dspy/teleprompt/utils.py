@@ -6,16 +6,13 @@ import random
 import shutil
 import sys
 
-import numpy as np
-
 try:
     from IPython.core.magics.code import extract_symbols
 except ImportError:
-    # Won't be able to read code from juptyer notebooks
+    # Won't be able to read code from jupyter notebooks
     extract_symbols = None
 
 import dspy
-from dspy.predict.parameter import Parameter
 from dspy.teleprompt.bootstrap import BootstrapFewShot, LabeledFewShot
 
 """
@@ -24,15 +21,20 @@ This file consists of helper functions for our variety of optimizers.
 
 ### OPTIMIZER TRAINING UTILS ###
 
+logger = logging.getLogger(__name__)
 
-def create_minibatch(trainset, batch_size=50):
+
+def create_minibatch(trainset, batch_size=50, rng=None):
     """Create a minibatch from the trainset."""
 
     # Ensure batch_size isn't larger than the size of the dataset
     batch_size = min(batch_size, len(trainset))
 
-    # Randomly sample indices for the mini-batch
-    sampled_indices = random.sample(range(len(trainset)), batch_size)
+    # If no RNG is provided, fall back to the global random instance
+    rng = rng or random
+
+    # Randomly sample indices for the mini-batch using the provided rng
+    sampled_indices = rng.sample(range(len(trainset)), batch_size)
 
     # Create the mini-batch using the sampled indices
     minibatch = [trainset[i] for i in sampled_indices]
@@ -40,24 +42,34 @@ def create_minibatch(trainset, batch_size=50):
     return minibatch
 
 
-def eval_candidate_program(batch_size, trainset, candidate_program, evaluate):
+def eval_candidate_program(batch_size, trainset, candidate_program, evaluate, rng=None):
     """Evaluate a candidate program on the trainset, using the specified batch size."""
-    # Evaluate on the full trainset
-    if batch_size >= len(trainset):
-        score = evaluate(candidate_program, devset=trainset, display_table=0)
-    # Or evaluate on a minibatch
-    else:
-        score = evaluate(
-            candidate_program,
-            devset=create_minibatch(trainset, batch_size),
-            display_table=0,
-        )
 
-    return score
+    try:
+        # Evaluate on the full trainset
+        if batch_size >= len(trainset):
+            return evaluate(candidate_program, devset=trainset, callback_metadata={"metric_key": "eval_full"})
+        # Or evaluate on a minibatch
+        else:
+            return evaluate(
+                candidate_program,
+                devset=create_minibatch(trainset, batch_size, rng),
+                callback_metadata={"metric_key": "eval_minibatch"}
+            )
+    except Exception:
+        logger.error("An exception occurred during evaluation", exc_info=True)
+        # TODO: Handle this better, as -ve scores are possible
+        return dspy.Prediction(score=0.0, results=[])
 
 
 def eval_candidate_program_with_pruning(
-    trial, trial_logs, trainset, candidate_program, evaluate, trial_num, batch_size=100,
+    trial,
+    trial_logs,
+    trainset,
+    candidate_program,
+    evaluate,
+    trial_num,
+    batch_size=100,
 ):
     """Evaluation of candidate_program with pruning implemented"""
 
@@ -71,7 +83,9 @@ def eval_candidate_program_with_pruning(
         end_index = min((i + 1) * batch_size, len(trainset))
         split_trainset = trainset[start_index:end_index]
         split_score = evaluate(
-            candidate_program, devset=split_trainset, display_table=0,
+            candidate_program,
+            devset=split_trainset,
+            display_table=0,
         )
         print(f"{i}st split score: {split_score}")
         total_eval_size += len(split_trainset)
@@ -105,31 +119,34 @@ def get_program_with_highest_avg_score(param_score_dict, fully_evaled_param_comb
     # Calculate the mean for each combination of categorical parameters, based on past trials
     results = []
     for key, values in param_score_dict.items():
-        scores = np.array([v[0] for v in values])
-        mean = np.average(scores)
+        scores = [v[0] for v in values]
+        mean = sum(scores) / len(scores)
         program = values[0][1]
-        results.append((key, mean, program))
+        params = values[0][2]
+        results.append((key, mean, program, params))
 
     # Sort results by the mean
     sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
 
     # Find the combination with the highest mean, skip fully evaluated ones
     for combination in sorted_results:
-        key, mean, program = combination
+        key, mean, program, params = combination
 
         if key in fully_evaled_param_combos:
             continue
 
-        print(f"Best Combination: {key} with Mean = {mean}")
+        return program, mean, key, params
 
-        return program, key
-
-    # If no valid program is found, we return the last valid one that we found
-    return program, key
+    raise ValueError("No valid program found in param_score_dict")
 
 
 def calculate_last_n_proposed_quality(
-    base_program, trial_logs, evaluate, trainset, devset, n,
+    base_program,
+    trial_logs,
+    evaluate,
+    trainset,
+    devset,
+    n,
 ):
     """
     Calculate the average and best quality of the last n programs proposed. This is useful for seeing if our proposals
@@ -169,7 +186,10 @@ def calculate_last_n_proposed_quality(
 
 
 def get_task_model_history_for_full_example(
-    candidate_program, task_model, devset, evaluate,
+    candidate_program,
+    task_model,
+    devset,
+    evaluate,
 ):
     """Get a full trace of the task model's history for a given candidate program."""
     _ = evaluate(candidate_program, devset=devset[:1])
@@ -184,7 +204,7 @@ def print_full_program(program):
         print(f"i: {get_signature(predictor).instructions}")
         *_, last_field = get_signature(predictor).fields.values()
         print(f"p: {last_field.json_schema_extra['prefix']}")
-        print("\n")
+    print("\n")
 
 
 def save_candidate_program(program, log_dir, trial_num, note=None):
@@ -199,9 +219,9 @@ def save_candidate_program(program, log_dir, trial_num, note=None):
 
     # Define the save path for the program
     if note:
-        save_path = os.path.join(eval_programs_dir, f"program_{trial_num}_{note}")
+        save_path = os.path.join(eval_programs_dir, f"program_{trial_num}_{note}.json")
     else:
-        save_path = os.path.join(eval_programs_dir, f"program_{trial_num}")
+        save_path = os.path.join(eval_programs_dir, f"program_{trial_num}.json")
 
     # Save the program
     program.save(save_path)
@@ -227,38 +247,78 @@ def setup_logging(log_dir):
         return
     # Create a logger
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
 
     # Create a file handler that logs debug and higher level messages
     file_handler = logging.FileHandler(f"{log_dir}/logs.txt")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.WARNING)
     file_formatter = logging.Formatter("%(asctime)s - %(message)s")
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
     # Create a console handler with a higher log level
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)
     console_formatter = logging.Formatter("%(message)s")
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
 
+def get_token_usage(model) -> tuple[int, int]:
+    """
+    Extract total input tokens and output tokens from a model's interaction history.
+    Returns (total_input_tokens, total_output_tokens).
+    """
+    if not hasattr(model, "history"):
+        return 0, 0
+
+    input_tokens = []
+    output_tokens = []
+    for interaction in model.history:
+        usage = interaction.get("usage", {})
+        _input_tokens = usage.get("prompt_tokens", 0)
+        _output_tokens = usage.get("completion_tokens", 0)
+        input_tokens.append(_input_tokens)
+        output_tokens.append(_output_tokens)
+
+    total_input_tokens = sum(input_tokens)
+    total_output_tokens = sum(output_tokens)
+    return total_input_tokens, total_output_tokens
+
+
+def log_token_usage(trial_logs, trial_num, model_dict):
+    """
+    Extract total input and output tokens used by each model and log to trial_logs[trial_num]["token_usage"].
+    """
+
+    token_usage_dict = {}
+
+    for model_name, model in model_dict.items():
+        in_tokens, out_tokens = get_token_usage(model)
+        token_usage_dict[model_name] = {"total_input_tokens": in_tokens, "total_output_tokens": out_tokens}
+
+    # Store token usage info in trial logs
+    trial_logs[trial_num]["token_usage"] = token_usage_dict
+
+
 ### OTHER UTILS ###
 
+
+def get_prompt_model(prompt_model):
+    if prompt_model:
+        return prompt_model
+    else:
+        return dspy.settings.lm
+
+
 def get_signature(predictor):
-    if hasattr(predictor, "extended_signature"):
-        return predictor.extended_signature
-    elif hasattr(predictor, "signature"):
-        return predictor.signature
-    return None
+    assert hasattr(predictor, "signature")
+    return predictor.signature
 
 
 def set_signature(predictor, updated_signature):
-    if hasattr(predictor, "extended_signature"):
-        predictor.extended_signature = updated_signature
-    elif hasattr(predictor, "signature"):
-        predictor.signature = updated_signature
+    assert hasattr(predictor, "signature")
+    predictor.signature = updated_signature
 
 
 def create_n_fewshot_demo_sets(
@@ -269,6 +329,7 @@ def create_n_fewshot_demo_sets(
     max_bootstrapped_demos,
     metric,
     teacher_settings,
+    max_errors=None,
     max_rounds=1,
     labeled_sample=True,
     min_num_samples=1,
@@ -276,11 +337,13 @@ def create_n_fewshot_demo_sets(
     teacher=None,
     include_non_bootstrapped=True,
     seed=0,
+    rng=None,
 ):
     """
     This function is copied from random_search.py, and creates fewshot examples in the same way that random search does.
     This allows us to take advantage of using the same fewshot examples when we use the same random seed in our optimizers.
     """
+    max_errors = dspy.settings.max_errors if max_errors is None else max_errors
     demo_candidates = {}
 
     # Account for confusing way this is set up, where we add in 3 more candidate sets to the N specified
@@ -289,49 +352,49 @@ def create_n_fewshot_demo_sets(
     # Initialize demo_candidates dictionary
     for i, _ in enumerate(student.predictors()):
         demo_candidates[i] = []
-    
-    starter_seed = seed
-    # Shuffle the trainset with the starter seed
-    random.Random(starter_seed).shuffle(trainset)
+
+    rng = rng or random.Random(seed)
 
     # Go through and create each candidate set
     for seed in range(-3, num_candidate_sets):
+        print(f"Bootstrapping set {seed + 4}/{num_candidate_sets + 3}")
 
-        trainset2 = list(trainset)
+        trainset_copy = list(trainset)
 
         if seed == -3 and include_non_bootstrapped:
             # zero-shot
             program2 = student.reset_copy()
 
-        elif (
-            seed == -2
-            and max_labeled_demos > 0
-            and include_non_bootstrapped
-        ):
+        elif seed == -2 and max_labeled_demos > 0 and include_non_bootstrapped:
             # labels only
             teleprompter = LabeledFewShot(k=max_labeled_demos)
             program2 = teleprompter.compile(
-                student, trainset=trainset2, sample=labeled_sample,
+                student,
+                trainset=trainset_copy,
+                sample=labeled_sample,
             )
 
         elif seed == -1:
             # unshuffled few-shot
             program = BootstrapFewShot(
                 metric=metric,
+                max_errors=max_errors,
+                metric_threshold=metric_threshold,
                 max_bootstrapped_demos=max_bootstrapped_demos,
                 max_labeled_demos=max_labeled_demos,
                 teacher_settings=teacher_settings,
                 max_rounds=max_rounds,
             )
-            program2 = program.compile(student, teacher=teacher, trainset=trainset2)
+            program2 = program.compile(student, teacher=teacher, trainset=trainset_copy)
 
         else:
             # shuffled few-shot
-            random.Random(seed).shuffle(trainset2)
-            size = random.Random(seed).randint(min_num_samples, max_bootstrapped_demos)
+            rng.shuffle(trainset_copy)
+            size = rng.randint(min_num_samples, max_bootstrapped_demos)
 
             teleprompter = BootstrapFewShot(
                 metric=metric,
+                max_errors=max_errors,
                 metric_threshold=metric_threshold,
                 max_bootstrapped_demos=size,
                 max_labeled_demos=max_labeled_demos,
@@ -340,7 +403,9 @@ def create_n_fewshot_demo_sets(
             )
 
             program2 = teleprompter.compile(
-                student, teacher=teacher, trainset=trainset2,
+                student,
+                teacher=teacher,
+                trainset=trainset_copy,
             )
 
         for i, _ in enumerate(student.predictors()):
@@ -348,20 +413,21 @@ def create_n_fewshot_demo_sets(
 
     return demo_candidates
 
+
 def old_getfile(object):
     """Work out which source or compiled file an object was defined in."""
     if inspect.ismodule(object):
-        if getattr(object, '__file__', None):
+        if getattr(object, "__file__", None):
             return object.__file__
-        raise TypeError('{!r} is a built-in module'.format(object))
+        raise TypeError(f"{object!r} is a built-in module")
     if inspect.isclass(object):
-        if hasattr(object, '__module__'):
+        if hasattr(object, "__module__"):
             module = sys.modules.get(object.__module__)
-            if getattr(module, '__file__', None):
+            if getattr(module, "__file__", None):
                 return module.__file__
-            if object.__module__ == '__main__':
-                raise OSError('source code not available')
-        raise TypeError('{!r} is a built-in class'.format(object))
+            if object.__module__ == "__main__":
+                raise OSError("source code not available")
+        raise TypeError(f"{object!r} is a built-in class")
     if inspect.ismethod(object):
         object = object.__func__
     if inspect.isfunction(object):
@@ -372,65 +438,26 @@ def old_getfile(object):
         object = object.f_code
     if inspect.iscode(object):
         return object.co_filename
-    raise TypeError('module, class, method, function, traceback, frame, or '
-                    'code object was expected, got {}'.format(
-                    type(object).__name__))
+    raise TypeError(
+        f"module, class, method, function, traceback, frame, or code object was expected, got {type(object).__name__}"
+    )
+
 
 def new_getfile(object):
     if not inspect.isclass(object):
         return old_getfile(object)
-    
+
     # Lookup by parent module (as in current inspect)
-    if hasattr(object, '__module__'):
+    if hasattr(object, "__module__"):
         object_ = sys.modules.get(object.__module__)
-        if hasattr(object_, '__file__'):
+        if hasattr(object_, "__file__"):
             return object_.__file__
-    
+
     # If parent module is __main__, lookup by methods (NEW)
-    for name, member in inspect.getmembers(object):
-        if inspect.isfunction(member) and object.__qualname__ + '.' + member.__name__ == member.__qualname__:
+    for _, member in inspect.getmembers(object):
+        if inspect.isfunction(member) and object.__qualname__ + "." + member.__name__ == member.__qualname__:
             return inspect.getfile(member)
-    raise TypeError(f'Source for {object!r} not found')
+    raise TypeError(f"Source for {object!r} not found")
+
 
 inspect.getfile = new_getfile
-
-def get_dspy_source_code(module):
-    header = []
-    base_code = ""
-
-    # Don't get source code for Predict or ChainOfThought modules (NOTE we will need to extend this list as more DSPy.modules are added)
-    if not type(module).__name__ == "Predict" and not type(module).__name__ == "ChainOfThought":
-        try:
-            base_code = inspect.getsource(type(module))
-        except TypeError:
-            obj = type(module)
-            cell_code = "".join(inspect.linecache.getlines(new_getfile(obj)))
-            class_code = extract_symbols(cell_code, obj.__name__)[0][0]
-            base_code = str(class_code)
-
-    completed_set = set()
-    for attribute in module.__dict__.keys():
-        try:
-            iterable = iter(getattr(module, attribute))
-        except TypeError:
-            iterable = [getattr(module, attribute)]
-
-        for item in iterable:
-            if item in completed_set:
-                continue
-            if isinstance(item, Parameter):
-                if hasattr(item, 'signature') and item.signature is not None and item.signature.__pydantic_parent_namespace__['signature_name'] + "_sig" not in completed_set:
-                    try:
-                        header.append(inspect.getsource(item.signature))
-                        print(inspect.getsource(item.signature))
-                    except (TypeError, OSError):
-                        header.append(str(item.signature))
-                    completed_set.add(item.signature.__pydantic_parent_namespace__['signature_name'] + "_sig")
-            if isinstance(item, dspy.Module):
-                code = get_dspy_source_code(item).strip()
-                if code not in completed_set:
-                    header.append(code)
-                    completed_set.add(code)
-            completed_set.add(item)
-        
-    return '\n\n'.join(header) + '\n\n' + base_code

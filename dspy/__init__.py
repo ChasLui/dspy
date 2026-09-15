@@ -1,57 +1,69 @@
-import dsp
-from dsp.modules.hf_client import ChatModuleClient, HFClientSGLang, HFClientVLLM, HFServerTGI
+import threading
 
-from .predict import *
-from .primitives import *
-from .retrieve import *
-from .signatures import *
-from .utils.logging import logger, set_log_output
+from dspy import lm15 as lm15
+from dspy.predict import *
+from dspy.primitives import *
+from dspy.retrievers import *
+from dspy.signatures import *
+from dspy.teleprompt import *
+from dspy.predict.flex import Flex
 
-# Functional must be imported after primitives, predict and signatures
-from .functional import *  # isort: skip
+from dspy.evaluate import Evaluate  # isort: skip
+from dspy.clients import *  # isort: skip
+from dspy.adapters import Adapter, ChatAdapter, JSONAdapter, XMLAdapter, TwoStepAdapter, Image, Audio, File, History, Type, Tool, ToolCalls, ToolCallResults, Code, Reasoning  # isort: skip
+from dspy.primitives.sandbox_serializable import SandboxSerializable  # isort: skip
+from dspy.utils.exceptions import (
+    AdapterParseError,
+    ContextWindowExceededError,
+    DSPyError,
+    LMAuthError,
+    LMBillingError,
+    LMConfigurationError,
+    LMError,
+    LMInvalidRequestError,
+    LMLockTimeoutError,
+    LMNotConfiguredError,
+    LMProviderError,
+    LMRateLimitError,
+    LMServerError,
+    LMStreamAssemblyError,
+    LMTimeoutError,
+    LMTransportError,
+    LMUnexpectedError,
+    LMUnsupportedFeatureError,
+    LMUnsupportedModelError,
+    is_retryable_lm_error,
+)
+from dspy.utils.logging_utils import configure_dspy_loggers, disable_logging, enable_logging
+from dspy.utils.asyncify import asyncify
+from dspy.utils.syncify import syncify
+from dspy.utils.saving import load
+from dspy.streaming.streamify import streamify
+from dspy.utils.usage_tracker import track_usage
 
-settings = dsp.settings
+from dspy.dsp.utils.settings import settings
+from dspy.dsp.colbertv2 import ColBERTv2
+from dspy.__metadata__ import __name__, __version__, __description__, __url__, __author__, __author_email__
 
-LM = dsp.LM
+configure_dspy_loggers(__name__)
 
-AzureOpenAI = dsp.AzureOpenAI
-OpenAI = dsp.GPT3
-MultiOpenAI = dsp.MultiOpenAI
-Mistral = dsp.Mistral
-Databricks = dsp.Databricks
-Cohere = dsp.Cohere
-ColBERTv2 = dsp.ColBERTv2
-ColBERTv2RerankerLocal = dsp.ColBERTv2RerankerLocal
-ColBERTv2RetrieverLocal = dsp.ColBERTv2RetrieverLocal
-Pyserini = dsp.PyseriniRetriever
-Clarifai = dsp.ClarifaiLLM
-CloudflareAI = dsp.CloudflareAI
-Google = dsp.Google
-GoogleVertexAI = dsp.GoogleVertexAI
-GROQ = dsp.GroqLM
-Snowflake = dsp.Snowflake
-Claude = dsp.Claude
-
-HFClientTGI = dsp.HFClientTGI
-HFClientVLLM = HFClientVLLM
-
-Anyscale = dsp.Anyscale
-Together = dsp.Together
-HFModel = dsp.HFModel
-OllamaLocal = dsp.OllamaLocal
-LlamaCpp = dsp.LlamaCpp
-
-Bedrock = dsp.Bedrock
-Sagemaker = dsp.Sagemaker
-AWSModel = dsp.AWSModel
-AWSMistral = dsp.AWSMistral
-AWSAnthropic = dsp.AWSAnthropic
-AWSMeta = dsp.AWSMeta
-
-Watsonx = dsp.Watsonx
-PremAI = dsp.PremAI
-
-You = dsp.You
-
+# Singleton definitions and aliasing
 configure = settings.configure
+load_settings = settings.load
 context = settings.context
+
+BootstrapRS = BootstrapFewShotWithRandomSearch
+
+_cache_lock = threading.Lock()
+
+
+def __getattr__(name):
+    """Defer building the cache until it's read, so that configure_cache can fully disable caching if desired."""
+    if name == "cache":
+        from dspy.clients import _get_dspy_cache
+
+        with _cache_lock:
+            if "cache" not in globals():
+                globals()["cache"] = _get_dspy_cache()
+            return globals()["cache"]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

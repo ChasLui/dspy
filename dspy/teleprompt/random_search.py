@@ -1,5 +1,6 @@
 import random
 
+import dspy
 from dspy.evaluate.evaluate import Evaluate
 from dspy.teleprompt.teleprompt import Teleprompter
 
@@ -27,18 +28,18 @@ class BootstrapFewShotWithRandomSearch(Teleprompter):
     def __init__(
         self,
         metric,
-        teacher_settings={},
+        teacher_settings=None,
         max_bootstrapped_demos=4,
         max_labeled_demos=16,
         max_rounds=1,
         num_candidate_programs=16,
-        num_threads=6,
-        max_errors=10,
+        num_threads=None,
+        max_errors=None,
         stop_at_score=None,
         metric_threshold=None,
     ):
         self.metric = metric
-        self.teacher_settings = teacher_settings
+        self.teacher_settings = teacher_settings or {}
         self.max_rounds = max_rounds
 
         self.num_threads = num_threads
@@ -48,20 +49,24 @@ class BootstrapFewShotWithRandomSearch(Teleprompter):
         self.max_num_samples = max_bootstrapped_demos
         self.max_errors = max_errors
         self.num_candidate_sets = num_candidate_programs
-        # self.max_num_traces = 1 + int(max_bootstrapped_demos / 2.0 * self.num_candidate_sets)
-
-        # Semi-hacky way to get the parent class's _bootstrap function to stop early.
-        # self.max_bootstrapped_demos = self.max_num_traces
         self.max_labeled_demos = max_labeled_demos
 
-        print(
-            "Going to sample between", self.min_num_samples, "and", self.max_num_samples, "traces per predictor.",
-        )
-        print("Will attempt to bootstrap", self.num_candidate_sets, "candidate sets.")
+        print(f"Going to sample between {self.min_num_samples} and {self.max_num_samples} traces per predictor.")
+        print(f"Will attempt to bootstrap {self.num_candidate_sets} candidate sets.")
 
     def compile(self, student, *, teacher=None, trainset, valset=None, restrict=None, labeled_sample=True):
         self.trainset = trainset
         self.valset = valset or trainset  # TODO: FIXME: Note this choice.
+
+        if restrict is not None:
+            restrict = set(restrict)
+            if not restrict.intersection(range(-3, self.num_candidate_sets)):
+                raise ValueError(
+                    f"`restrict` {restrict!r} does not match any candidate seed in "
+                    f"range(-3, {self.num_candidate_sets}); no candidate programs would be evaluated."
+                )
+
+        effective_max_errors = self.max_errors if self.max_errors is not None else dspy.settings.max_errors
 
         scores = []
         all_subscores = []
@@ -71,88 +76,72 @@ class BootstrapFewShotWithRandomSearch(Teleprompter):
             if (restrict is not None) and (seed not in restrict):
                 continue
 
-            trainset2 = list(self.trainset)
+            trainset_copy = list(self.trainset)
 
             if seed == -3:
                 # zero-shot
-                program2 = student.reset_copy()
+                program = student.reset_copy()
 
             elif seed == -2:
                 # labels only
                 teleprompter = LabeledFewShot(k=self.max_labeled_demos)
-                program2 = teleprompter.compile(student, trainset=trainset2, sample=labeled_sample)
+                program = teleprompter.compile(student, trainset=trainset_copy, sample=labeled_sample)
 
             elif seed == -1:
                 # unshuffled few-shot
-                program = BootstrapFewShot(
+                optimizer = BootstrapFewShot(
                     metric=self.metric,
                     metric_threshold=self.metric_threshold,
                     max_bootstrapped_demos=self.max_num_samples,
                     max_labeled_demos=self.max_labeled_demos,
                     teacher_settings=self.teacher_settings,
                     max_rounds=self.max_rounds,
+                    max_errors=effective_max_errors,
                 )
-                program2 = program.compile(student, teacher=teacher, trainset=trainset2)
+                program = optimizer.compile(student, teacher=teacher, trainset=trainset_copy)
 
             else:
                 assert seed >= 0, seed
 
-                random.Random(seed).shuffle(trainset2)
+                random.Random(seed).shuffle(trainset_copy)
                 size = random.Random(seed).randint(self.min_num_samples, self.max_num_samples)
 
-                teleprompter = BootstrapFewShot(
+                optimizer = BootstrapFewShot(
                     metric=self.metric,
                     metric_threshold=self.metric_threshold,
                     max_bootstrapped_demos=size,
                     max_labeled_demos=self.max_labeled_demos,
                     teacher_settings=self.teacher_settings,
                     max_rounds=self.max_rounds,
+                    max_errors=effective_max_errors,
                 )
 
-                program2 = teleprompter.compile(student, teacher=teacher, trainset=trainset2)
+                program = optimizer.compile(student, teacher=teacher, trainset=trainset_copy)
 
             evaluate = Evaluate(
                 devset=self.valset,
                 metric=self.metric,
                 num_threads=self.num_threads,
-                max_errors=self.max_errors,
+                max_errors=effective_max_errors,
                 display_table=False,
                 display_progress=True,
             )
 
-            score, subscores = evaluate(program2, return_all_scores=True)
+            result = evaluate(program)
+
+            score, subscores = result.score, [output[2] for output in result.results]
 
             all_subscores.append(subscores)
 
-            ############ Assertion-aware Optimization ############
-            if hasattr(program2, "_suggest_failures"):
-                score = score - program2._suggest_failures * 0.2
-            if hasattr(program2, "_assert_failures"):
-                score = 0 if program2._assert_failures > 0 else score
-            ######################################################
-
-            print("Score:", score, "for set:", [len(predictor.demos) for predictor in program2.predictors()])
-
             if len(scores) == 0 or score > max(scores):
-                print("New best sscore:", score, "for seed", seed)
-                best_program = program2
+                print("New best score:", score, "for seed", seed)
+                best_program = program
 
             scores.append(score)
             print(f"Scores so far: {scores}")
+            print(f"Best score so far: {max(scores)}")
 
-            print("Best score:", max(scores))
-
-            score_data.append((score, subscores, seed, program2))
-
-            if len(score_data) > 2:  # We check if there are at least 3 scores to consider
-                for k in [1, 2, 3, 5, 8, 9999]:
-                    top_3_scores = sorted(score_data, key=lambda x: x[0], reverse=True)[:k]
-
-                    # Transpose the subscores to get max per entry and then calculate their average
-                    transposed_subscores = zip(*[subscores for _, subscores, *_ in top_3_scores if subscores])
-                    avg_of_max_per_entry = sum(max(entry) for entry in transposed_subscores) / len(top_3_scores[0][1])
-
-                    print(f"Average of max per entry across top {k} scores: {avg_of_max_per_entry}")
+            score_data.append({"score": score, "subscores": subscores, "seed": seed, "program": program})
 
             if self.stop_at_score is not None and score >= self.stop_at_score:
                 print(f"Stopping early because score {score} is >= stop_at_score {self.stop_at_score}")
@@ -160,7 +149,9 @@ class BootstrapFewShotWithRandomSearch(Teleprompter):
 
         # To best program, attach all program candidates in decreasing average score
         best_program.candidate_programs = score_data
-        best_program.candidate_programs = sorted(best_program.candidate_programs, key=lambda x: x[0], reverse=True)
+        best_program.candidate_programs = sorted(
+            best_program.candidate_programs, key=lambda x: x["score"], reverse=True
+        )
 
         print(f"{len(best_program.candidate_programs)} candidate programs found.")
 

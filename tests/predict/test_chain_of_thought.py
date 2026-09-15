@@ -1,35 +1,85 @@
-import textwrap
+from unittest import mock
+
+import pytest
+from litellm.utils import Choices, Message, ModelResponse
+
 import dspy
 from dspy import ChainOfThought
 from dspy.utils import DummyLM
 
 
 def test_initialization_with_string_signature():
-    lm = DummyLM(["find the number after 1", "2"])
-    dspy.settings.configure(lm=lm)
+    lm = DummyLM([{"reasoning": "find the number after 1", "answer": "2"}])
+    dspy.configure(lm=lm)
     predict = ChainOfThought("question -> answer")
-    assert list(predict.extended_signature.output_fields.keys()) == [
-        "rationale",
+    assert list(predict.predict.signature.output_fields.keys()) == [
+        "reasoning",
         "answer",
     ]
     assert predict(question="What is 1+1?").answer == "2"
 
-    print(lm.get_convo(-1))
-    assert lm.get_convo(-1) == textwrap.dedent(
-        """\
-        Given the fields `question`, produce the fields `answer`.
 
-        ---
+@pytest.mark.asyncio
+async def test_async_chain_of_thought():
+    lm = DummyLM([{"reasoning": "find the number after 1", "answer": "2"}])
+    with dspy.context(lm=lm):
+        program = ChainOfThought("question -> answer")
+        result = await program.acall(question="What is 1+1?")
+        assert result.answer == "2"
 
-        Follow the following format.
 
-        Question: ${question}
-        Reasoning: Let's think step by step in order to ${produce the answer}. We ...
-        Answer: ${answer}
+def test_chain_of_thought_with_native_reasoning():
+    """Test ChainOfThought with a model that supports native reasoning, but using manual fields."""
 
-        ---
+    lm = dspy.LM(engine="litellm", model="anthropic/claude-3-7-sonnet-20250219", cache=False)
+    dspy.settings.configure(lm=lm)
 
-        Question: What is 1+1?
-        Reasoning: Let's think step by step in order to find the number after 1
-        Answer: 2"""
-    )
+    with mock.patch("litellm.completion") as mock_completion:
+        mock_completion.return_value = ModelResponse(
+            choices=[
+                Choices(
+                    message=Message(
+                        content=(
+                            "[[ ## reasoning ## ]]\nStep-by-step thinking about the capital of France\n"
+                            "[[ ## answer ## ]]\nParis\n[[ ## completion ## ]]"
+                        )
+                    ),
+                )
+            ],
+            model="anthropic/claude-3-7-sonnet-20250219",
+        )
+
+        cot = ChainOfThought("question -> answer")
+        result = cot(question="What is the capital of France?")
+        assert result.answer == "Paris"
+        assert isinstance(result.reasoning, str)
+        assert result.reasoning == "Step-by-step thinking about the capital of France"
+
+        args, kwargs = mock_completion.call_args
+
+
+def test_chain_of_thought_with_manual_reasoning():
+    """Test ChainOfThought with manual reasoning where LM doesn't support native reasoning."""
+    lm = dspy.LM(engine="litellm", model="openai/gpt-4o-mini")
+    dspy.settings.configure(lm=lm)
+
+    with mock.patch("litellm.completion") as mock_completion:
+        mock_completion.return_value = ModelResponse(
+            choices=[
+                Choices(
+                    reasoning="Step-by-step thinking about the capital of France",
+                    message=Message(
+                        content=(
+                            "[[ ## reasoning ## ]]\nStep-by-step thinking about the capital of France\n"
+                            "[[ ## answer ## ]]\nParis\n[[ ## completion ## ]]"
+                        )
+                    ),
+                )
+            ],
+            model="openai/gpt-4o-mini",
+        )
+
+        cot = ChainOfThought("question -> answer")
+        result = cot(question="What is the capital of France?")
+        assert result.answer == "Paris"
+        assert result.reasoning == "Step-by-step thinking about the capital of France"

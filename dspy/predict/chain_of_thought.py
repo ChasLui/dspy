@@ -1,51 +1,55 @@
-import dspy
-from dspy.primitives.program import Module
-from dspy.signatures.signature import ensure_signature
+from typing import Any
 
-# TODO: This shouldn't inherit from Predict. It should be a module that has one or two predictors.
-# Let's focus on the activated case. It's a predictor with the expanded signature.
-# Now, when deactivated, it's a predictor with the original signature.
-# When activate is None, though, we need the expanded one but during forward we need to pass the right signature.
+from pydantic.fields import FieldInfo
+
+import dspy
+from dspy.primitives.module import Module
+from dspy.signatures.signature import Signature, ensure_signature
+
+# NOTE: This restores the legacy rationale_field behavior after PR #8822.
 
 
 class ChainOfThought(Module):
-    def __init__(self, signature, rationale_type=None, activated=True, **config):
+    """A module that reasons step by step before producing the output.
+
+    Extends a given signature with an additional ``reasoning`` output field that
+    the language model fills in before answering. This chain-of-thought process
+    improves accuracy on tasks that require multi-step logic or explanation.
+
+    Args:
+        signature: The DSPy signature defining the module's inputs and outputs.
+        rationale_field: An optional custom ``FieldInfo`` for the reasoning field.
+            If not provided, a default field with description ``${reasoning}`` is used.
+        rationale_field_type: The type annotation for the reasoning field. Defaults
+            to ``str``. Ignored if ``rationale_field`` is provided.
+        **config: Additional keyword arguments forwarded to the underlying
+            ``dspy.Predict`` module.
+
+    Example:
+        >>> import dspy
+        >>> cot = dspy.ChainOfThought("question -> answer")
+        >>> result = cot(question="What is the capital of France?")
+        >>> print(result.reasoning)
+        >>> print(result.answer)
+    """
+
+    def __init__(
+        self,
+        signature: str | type[Signature],
+        rationale_field: FieldInfo | None = None,
+        rationale_field_type: type = str,
+        **config: dict[str, Any],
+    ):
         super().__init__()
-
-        self.activated = activated
-
-        self.signature = signature = ensure_signature(signature)
-        *_keys, last_key = signature.output_fields.keys()
-
-        prefix = "Reasoning: Let's think step by step in order to"
-        if dspy.settings.experimental:
-            desc = "${produce the output fields}. We ..."
-        else:
-            desc = f"${{produce the {last_key}}}. We ..."
-
-        rationale_type = rationale_type or dspy.OutputField(prefix=prefix, desc=desc)
-        # Add "rationale" field to the output signature.
-        extended_signature = signature.prepend("rationale", rationale_type, type_=str)
-        self._predict = dspy.Predict(extended_signature, **config)
-        self._predict.extended_signature = extended_signature
+        signature = ensure_signature(signature)
+        desc = "${reasoning}"
+        rationale_field_type = rationale_field.annotation if rationale_field else rationale_field_type
+        rationale_field = rationale_field if rationale_field else dspy.OutputField(desc=desc)
+        extended_signature = signature.prepend(name="reasoning", field=rationale_field, type_=rationale_field_type)
+        self.predict = dspy.Predict(extended_signature, **config)
 
     def forward(self, **kwargs):
-        assert self.activated in [True, False]
+        return self.predict(**kwargs)
 
-        signature = kwargs.pop("new_signature", self._predict.extended_signature if self.activated else self.signature)
-        return self._predict(signature=signature, **kwargs)
-
-    @property
-    def demos(self):
-        return self._predict.demos
-
-    @property
-    def extended_signature(self):
-        return self._predict.extended_signature
-
-
-"""
-TODO: In principle, we can update the field's prefix during forward too to fill any thing based on the input args.
-
-IF the user didn't overwrite our default rationale_type.
-"""
+    async def aforward(self, **kwargs):
+        return await self.predict.acall(**kwargs)

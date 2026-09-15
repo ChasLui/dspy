@@ -1,104 +1,161 @@
+from __future__ import annotations
+
 import random
-import re
-from typing import Union
+from collections import defaultdict
+from typing import Any
 
-import numpy as np
+from dspy.adapters.chat_adapter import FieldInfoWithName, field_header_pattern
+from dspy.clients.base_lm import BaseLM
+from dspy.dsp.utils.utils import dotdict
+from dspy.signatures.field import OutputField
+from dspy.utils.lazy_import import require
 
-from dsp.modules import LM
-from dsp.utils.utils import dotdict
+np = require("numpy")
 
 
-class DummyLM(LM):
-    """Dummy language model for unit testing purposes."""
+class DummyLM(BaseLM):
+    """Dummy language model for unit testing purposes.
 
-    def __init__(self, answers: Union[list[str], dict[str, str]], follow_examples: bool = False):
-        """Initializes the dummy language model.
+    Three modes of operation:
 
-        Parameters:
-        - answers: A list of strings or a dictionary with string keys and values.
-        - follow_examples: If True, and the prompt contains an example exactly equal to the prompt,
-                           the dummy model will return the next string in the list for each request.
-        If a list is provided, the dummy model will return the next string in the list for each request.
-        If a dictionary is provided, the dummy model will return the value corresponding to the key that matches the prompt.
-        """
-        super().__init__("dummy-model")
-        self.provider = "dummy"
+    Mode 1: List of dictionaries
+
+    If a list of dictionaries is provided, the dummy model will return the next dictionary
+    in the list for each request, formatted according to the `format_field_with_value` function.
+
+    Examples:
+
+    ```
+    lm = DummyLM([{"answer": "red"}, {"answer": "blue"}])
+    dspy.configure(lm=lm)
+    predictor("What color is the sky?")
+    # Output:
+    # [[## answer ##]]
+    # red
+    predictor("What color is the sky?")
+    # Output:
+    # [[## answer ##]]
+    # blue
+    ```
+
+    Mode 2: Dictionary of dictionaries
+
+    If a dictionary of dictionaries is provided, the dummy model will return the value
+    corresponding to the key which is contained with the final message of the prompt,
+    formatted according to the `format_field_with_value` function from the chat adapter.
+
+    ```
+    lm = DummyLM({"What color is the sky?": {"answer": "blue"}})
+    dspy.configure(lm=lm)
+    predictor("What color is the sky?")
+    # Output:
+    # [[## answer ##]]
+    # blue
+    ```
+
+    Mode 3: Follow examples
+
+    If `follow_examples` is set to True, and the prompt contains an example input exactly equal to the prompt,
+    the dummy model will return the output from that example.
+
+    ```
+    lm = DummyLM([{"answer": "red"}], follow_examples=True)
+    dspy.configure(lm=lm)
+    predictor("What color is the sky?, demos=dspy.Example(input="What color is the sky?", output="blue"))
+    # Output:
+    # [[## answer ##]]
+    # blue
+    ```
+
+    """
+
+    def __init__(
+        self,
+        answers: list[dict[str, Any]] | dict[str, dict[str, Any]],
+        follow_examples: bool = False,
+        reasoning: bool = False,
+        adapter=None,
+    ):
+        super().__init__("dummy", "chat", 0.0, 1000, True)
         self.answers = answers
+        if isinstance(answers, list):
+            self.answers = iter(answers)
         self.follow_examples = follow_examples
+        self.reasoning = reasoning
 
-    def basic_request(self, prompt, n=1, **kwargs) -> dict[str, list[dict[str, str]]]:
-        """Generates a dummy response based on the prompt."""
-        dummy_response = {"choices": []}
-        for _ in range(n):
-            answer = None
+        # Set adapter, defaulting to ChatAdapter
+        if adapter is None:
+            from dspy.adapters.chat_adapter import ChatAdapter
+            adapter = ChatAdapter()
+        self.adapter = adapter
 
-            if self.follow_examples:
-                prefix = prompt.split("\n")[-1]
-                _instructions, _format, *examples, _output = prompt.split("\n---\n")
-                examples_str = "\n".join(examples)
-                possible_answers = re.findall(prefix + r"\s*(.*)", examples_str)
-                if possible_answers:
-                    # We take the last answer, as the first one is just from
-                    # the "Follow the following format" section.
-                    answer = possible_answers[-1]
-                    print(f"DummyLM got found previous example for {prefix} with value {answer=}")
-                else:
-                    print(f"DummyLM couldn't find previous example for {prefix=}")
+        from dspy.clients.engines.dummy_engine import AsyncDummyEngine, DummyEngine
 
-            if answer is None:
-                if isinstance(self.answers, dict):
-                    answer = next((v for k, v in self.answers.items() if k in prompt), None)
-                else:
-                    if len(self.answers) > 0:
-                        answer = self.answers[0]
-                        self.answers = self.answers[1:]
+        self._engine_spec = DummyEngine(self)
+        self._async_engine_spec = AsyncDummyEngine(self._engine_spec)
+        # DummyLM has always consumed scripted answers even for repeated calls.
+        self._cache_responses = False
 
-            if answer is None:
-                answer = "No more responses"
+    def _use_example(self, messages):
+        # find all field names
+        fields = defaultdict(int)
+        for message in messages:
+            if "content" in message:
+                if ma := field_header_pattern.match(message["content"]):
+                    fields[message["content"][ma.start() : ma.end()]] += 1
+        # find the fields which are missing from the final turns
+        max_count = max(fields.values())
+        output_fields = [field for field, count in fields.items() if count != max_count]
 
-            # Mimic the structure of a real language model response.
-            dummy_response["choices"].append(
-                {
-                    "text": answer,
-                    "finish_reason": "simulated completion",
-                },
-            )
+        # get the output from the last turn that has the output fields as headers
+        final_input = messages[-1]["content"].split("\n\n")[0]
+        for input, output in zip(reversed(messages[:-1]), reversed(messages), strict=False):
+            if any(field in output["content"] for field in output_fields) and final_input in input["content"]:
+                return output["content"]
 
-            RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
-            print("=== DummyLM ===")
-            print(prompt, end="")
-            print(f"{RED}{answer}{RESET}")
-            print("===")
-
-        # Simulate processing and storing the request and response.
-        history_entry = {
-            "prompt": prompt,
-            "response": dummy_response,
-            "kwargs": kwargs,
-            "raw_kwargs": kwargs,
+    def _format_answer_fields(self, field_names_and_values: dict[str, Any]):
+        fields_with_values = {
+            FieldInfoWithName(name=field_name, info=OutputField()): value
+            for field_name, value in field_names_and_values.items()
         }
-        self.history.append(history_entry)
+        # The reason why DummyLM needs an adapter is because it needs to know which output format to mimic.
+        # Normally LMs should not have any knowledge of an adapter, because the output format is defined in the prompt.
+        adapter = self.adapter
 
-        return dummy_response
+        # Try to use role="assistant" if the adapter supports it (like JSONAdapter)
+        try:
+            return adapter.format_field_with_value(fields_with_values, role="assistant")
+        except TypeError:
+            # Fallback for adapters that don't support role parameter (like ChatAdapter)
+            return adapter.format_field_with_value(fields_with_values)
 
-    def __call__(self, prompt, _only_completed=True, _return_sorted=False, **kwargs):
-        """Retrieves dummy completions."""
-        response = self.basic_request(prompt, **kwargs)
-        choices = response["choices"]
+    def forward(self, prompt=None, messages=None, **kwargs):
+        from dspy.clients.execution import execute, prepare
 
-        # Filter choices and return text completions.
-        return [choice["text"] for choice in choices]
+        return execute(self, prepare(self, prompt, messages, kwargs, direct=True)).provider_response()
 
-    def get_convo(self, index) -> str:
-        """Get the prompt + anwer from the ith message."""
-        return self.history[index]["prompt"] + " " + self.history[index]["response"]["choices"][0]["text"]
+    async def aforward(self, prompt=None, messages=None, **kwargs):
+        # Preserve the historical subclass extension point on async calls.
+        return self.forward(prompt=prompt, messages=messages, **kwargs)
+
+    def copy(self, **kwargs):
+        from dspy.clients.engines.dummy_engine import AsyncDummyEngine, DummyEngine
+
+        copied = super().copy(**kwargs)
+        copied._engine_spec = DummyEngine(copied)
+        copied._async_engine_spec = AsyncDummyEngine(copied._engine_spec)
+        return copied
+
+    def get_convo(self, index):
+        """Get the prompt + answer from the ith message."""
+        return self.history[index]["messages"], self.history[index]["outputs"]
 
 
 def dummy_rm(passages=()) -> callable:
     if not passages:
 
         def inner(query: str, *, k: int, **kwargs):
-            assert False, "No passages defined"
+            raise ValueError("No passages defined")
 
         return inner
     max_length = max(map(len, passages)) + 100
@@ -110,8 +167,8 @@ def dummy_rm(passages=()) -> callable:
         query_vec = vectorizer([query])[0]
         scores = passage_vecs @ query_vec
         largest_idx = (-scores).argsort()[:k]
-        # return dspy.Prediction(passages=[passages[i] for i in largest_idx])
-        return [dotdict(dict(long_text=passages[i])) for i in largest_idx]
+
+        return [dotdict(long_text=passages[i]) for i in largest_idx]
 
     return inner
 
@@ -129,7 +186,7 @@ class DummyVectorizer:
     def _hash(self, gram):
         """Hashes a string using a polynomial hash function."""
         h = 1
-        for coeff, c in zip(self.coeffs, gram):
+        for coeff, c in zip(self.coeffs, gram, strict=False):
             h = h * coeff + ord(c)
             h %= self.P
         return h % self.max_length

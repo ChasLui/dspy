@@ -1,514 +1,866 @@
 import logging
-import os
-import pickle
+import math
 import random
-import sys
-import textwrap
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
-import numpy as np
-import optuna
-
+import dspy
 from dspy.evaluate.evaluate import Evaluate
 from dspy.propose import GroundedProposer
 from dspy.teleprompt.teleprompt import Teleprompter
 from dspy.teleprompt.utils import (
+    create_minibatch,
     create_n_fewshot_demo_sets,
     eval_candidate_program,
-    get_dspy_source_code,
     get_program_with_highest_avg_score,
     get_signature,
-    get_task_model_history_for_full_example,
     print_full_program,
     save_candidate_program,
-    save_file_to_log_dir,
     set_signature,
-    setup_logging,
 )
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
+if TYPE_CHECKING:
+    import optuna
 
-"""
-USAGE SUGGESTIONS:
+logger = logging.getLogger(__name__)
 
-The following code can be used to compile a optimized signature teleprompter using MIPRO, and evaluate it on an end task:
 
-``` python
-from dspy.teleprompt import MIPROv2
+def _import_optuna():
+    try:
+        import optuna
+    except ModuleNotFoundError as exc:
+        if exc.name == "optuna":
+            raise ImportError(
+                "MIPROv2 requires optional dependency 'optuna'. "
+                "Install it with `pip install dspy[optuna]`."
+            ) from exc
+        raise
+    return optuna
 
-teleprompter = MIPROv2(prompt_model=prompt_model, task_model=task_model, metric=metric, num_candidates=10, init_temperature=1.0)
-kwargs = dict(num_threads=NUM_THREADS, display_progress=True, display_table=0)
-compiled_prompt_opt = teleprompter.compile(program, trainset=trainset[:TRAIN_NUM], num_batches=100, max_bootstrapped_demos=3, max_labeled_demos=5, eval_kwargs=kwargs)
-eval_score = evaluate(compiled_prompt_opt, devset=evalset[:EVAL_NUM], **kwargs)
-```
 
-Note that this teleprompter takes in the following parameters:
-
-* prompt_model: The model used for prompt generation. When unspecified, defaults to the model set in settings (i.e., dspy.settings.configure(lm=task_model)).
-* task_model: The model used for running your task. When unspecified, defaults to the model set in settings (i.e., dspy.settings.configure(lm=task_model)).
-* teacher_settings: The settings used for the teacher model. When unspecified, defaults to the settings set in settings (i.e., dspy.settings.configure(lm=task_model)).
-    The teacher settings are used to generate the fewshot examples.  This is the LLM/settings to use as a task model for the bootstrapping runs.
-    Typically you would want to use a model of equal or greater quality to your task model.
-* metric: The task metric used for optimization.
-* num_candidates: The number of new prompts and sets of fewshot examples to generate and evaluate. Default=10.
-* init_temperature: The temperature used to generate new prompts. Higher roughly equals more creative. Default=1.0.
-* verbose: Tells the method whether or not to print intermediate steps.
-* track_stats: Tells the method whether or not to track statistics about the optimization process.
-                If True, the method will track a dictionary with a key corresponding to the trial number, 
-                and a value containing a dict with the following keys:
-                    * program: the program being evaluated at a given trial
-                    * score: the last average evaluated score for the program
-                    * pruned: whether or not this program was pruned
-                This information will be returned as attributes of the best program.
-* log_dir: The directory to save logs and other information to. If unspecified, no logs will be saved.
-* view_data_batch_size: The number of examples to view in the data batch when producing the dataset summary. Default=10.
-* minibatch_size: The size of the minibatch to use when evaluating the program if using minibatched evaluations. Default=25.
-* minibatch_full_eval_steps: The number of steps to take before doing a full evaluation of the program if using minibatched evaluations. Default=10.
-* metric_threshold: If the metric yields a numerical value, then check it against this threshold when deciding whether or not to accept a bootstrap example.
-"""
-
+# Constants
 BOOTSTRAPPED_FEWSHOT_EXAMPLES_IN_CONTEXT = 3
 LABELED_FEWSHOT_EXAMPLES_IN_CONTEXT = 0
+MIN_MINIBATCH_SIZE = 50
 
-MB_FULL_EVAL_STEPS = 10
-MINIBATCH_SIZE = 25#50
+AUTO_RUN_SETTINGS = {
+    "light": {"n": 6, "val_size": 100},
+    "medium": {"n": 12, "val_size": 300},
+    "heavy": {"n": 18, "val_size": 1000},
+}
+
+# ANSI escape codes for colors
+YELLOW = "\033[93m"
+GREEN = "\033[92m"
+BLUE = "\033[94m"
+BOLD = "\033[1m"
+ENDC = "\033[0m"  # Resets the color to default
+
 
 class MIPROv2(Teleprompter):
     def __init__(
         self,
-        prompt_model=None,
-        task_model=None,
-        teacher_settings={},
-        num_candidates=10,
-        metric=None,
-        init_temperature=1.4,
-        verbose=False,
-        track_stats=True,
-        log_dir=None,
-        view_data_batch_size=10,
-        minibatch_size=MINIBATCH_SIZE,
-        minibatch_full_eval_steps=MB_FULL_EVAL_STEPS,
-        metric_threshold=None,
+        metric: Callable,
+        prompt_model: Any | None = None,
+        task_model: Any | None = None,
+        teacher_settings: dict | None = None,
+        max_bootstrapped_demos: int = 4,
+        max_labeled_demos: int = 4,
+        auto: Literal["light", "medium", "heavy"] | None = "light",
+        num_candidates: int | None = None,
+        num_threads: int | None = None,
+        max_errors: int | None = None,
+        seed: int = 9,
+        init_temperature: float = 1.0,
+        verbose: bool = False,
+        track_stats: bool = True,
+        log_dir: str | None = None,
+        metric_threshold: float | None = None,
     ):
-        self.n = num_candidates
+        # Validate 'auto' parameter
+        allowed_modes = {None, "light", "medium", "heavy"}
+        if auto not in allowed_modes:
+            raise ValueError(f"Invalid value for auto: {auto}. Must be one of {allowed_modes}.")
+        self.auto = auto
+        self.num_fewshot_candidates = num_candidates
+        self.num_instruct_candidates = num_candidates
+        self.num_candidates = num_candidates
         self.metric = metric
         self.init_temperature = init_temperature
-        self.prompt_model = prompt_model
-        self.task_model = task_model
+        self.task_model = task_model if task_model else dspy.settings.lm
+        self.prompt_model = prompt_model if prompt_model else dspy.settings.lm
+        self.max_bootstrapped_demos = max_bootstrapped_demos
+        self.max_labeled_demos = max_labeled_demos
         self.verbose = verbose
         self.track_stats = track_stats
         self.log_dir = log_dir
-        self.view_data_batch_size = view_data_batch_size
-        self.teacher_settings = teacher_settings
+        self.teacher_settings = teacher_settings or {}
         self.prompt_model_total_calls = 0
         self.total_calls = 0
-        self.minibatch_size = minibatch_size
-        self.minibatch_full_eval_steps = minibatch_full_eval_steps
-        self.metric_threshold = None
+        self.num_threads = num_threads
+        self.max_errors = max_errors
+        self.metric_threshold = metric_threshold
+        self.seed = seed
+        self.rng = None
 
-        # Check if WANDB_RUN_ID is set in the environment
-        self.wandb_run_id = None
-    
-    def _get_batch_size(
-        self,
-        minibatch,
-        trainset,
-    ):
-        if minibatch:
-            return self.minibatch_size
-        else:
-            return len(trainset)
+        if not self.prompt_model or not self.task_model:
+            raise ValueError("Either provide both prompt_model and task_model or set a default LM through dspy.configure(lm=...)")
 
     def compile(
         self,
-        student,
+        student: Any,
         *,
-        trainset,
-        valset=None,
-        num_batches=30,
-        max_bootstrapped_demos=5,
-        max_labeled_demos=2,
-        eval_kwargs={},
-        seed=9,
-        minibatch=True,
-        program_aware_proposer=True,
-        requires_permission_to_run=True,
-    ):
-        # Define ANSI escape codes for colors
-        YELLOW = "\033[93m"
-        BLUE = "\033[94m"
-        BOLD = "\033[1m"
-        ENDC = "\033[0m"  # Resets the color to default
+        trainset: list,
+        teacher: Any = None,
+        valset: list | None = None,
+        num_trials: int | None = None,
+        max_bootstrapped_demos: int | None = None,
+        max_labeled_demos: int | None = None,
+        seed: int | None = None,
+        minibatch: bool = True,
+        minibatch_size: int = 35,
+        minibatch_full_eval_steps: int = 5,
+        program_aware_proposer: bool = True,
+        data_aware_proposer: bool = True,
+        view_data_batch_size: int = 10,
+        tip_aware_proposer: bool = True,
+        fewshot_aware_proposer: bool = True,
+        requires_permission_to_run: bool | None = None, # deprecated
+        provide_traceback: bool | None = None,
+    ) -> Any:
+        if requires_permission_to_run == False:
+            logger.warning(
+                "'requires_permission_to_run' is deprecated and will be removed in a future version."
+            )
+        elif requires_permission_to_run == True:
+            raise ValueError("User confirmation is removed from MIPROv2. Please remove the 'requires_permission_to_run' argument.")
 
-        random.seed(seed)
-        valset = valset or trainset
-        estimated_prompt_model_calls = 10 + self.n * len(
-                student.predictors(),
-            ) + (0 if not program_aware_proposer else len(student.predictors()) + 1)  # num data summary calls + N * P + (P + 1)
-        
-        prompt_model_line = ""
-        if not program_aware_proposer:
-            prompt_model_line = f"""{YELLOW}- Prompt Model: {BLUE}{BOLD}10{ENDC}{YELLOW} data summarizer calls + {BLUE}{BOLD}{self.n}{ENDC}{YELLOW} * {BLUE}{BOLD}{len(student.predictors())}{ENDC}{YELLOW} lm calls in program = {BLUE}{BOLD}{estimated_prompt_model_calls}{ENDC}{YELLOW} prompt model calls{ENDC}"""
-        else:
-            prompt_model_line = f"""{YELLOW}- Prompt Model: {BLUE}{BOLD}10{ENDC}{YELLOW} data summarizer calls + {BLUE}{BOLD}{self.n}{ENDC}{YELLOW} * {BLUE}{BOLD}{len(student.predictors())}{ENDC}{YELLOW} lm calls in program + ({BLUE}{BOLD}{len(student.predictors()) + 1}{ENDC}{YELLOW}) lm calls in program aware proposer = {BLUE}{BOLD}{estimated_prompt_model_calls}{ENDC}{YELLOW} prompt model calls{ENDC}"""
+        effective_max_errors = (
+            self.max_errors
+            if self.max_errors is not None
+            else dspy.settings.max_errors
+        )
 
-        estimated_task_model_calls_wo_module_calls = 0
-        task_model_line = ""
-        if not minibatch:
-            estimated_task_model_calls_wo_module_calls = len(trainset) * num_batches  # M * T * P
-            task_model_line = f"""{YELLOW}- Task Model: {BLUE}{BOLD}{len(trainset)}{ENDC}{YELLOW} examples in train set * {BLUE}{BOLD}{num_batches}{ENDC}{YELLOW} batches * {BLUE}{BOLD}# of LM calls in your program{ENDC}{YELLOW} = ({BLUE}{BOLD}{estimated_task_model_calls_wo_module_calls} * # of LM calls in your program{ENDC}{YELLOW}) task model calls{ENDC}"""
-        else:
-            estimated_task_model_calls_wo_module_calls = self.minibatch_size * num_batches + (len(trainset) * (num_batches // self.minibatch_full_eval_steps))  # B * T * P
-            task_model_line = f"""{YELLOW}- Task Model: {BLUE}{BOLD}{self.minibatch_size}{ENDC}{YELLOW} examples in minibatch * {BLUE}{BOLD}{num_batches}{ENDC}{YELLOW} batches + {BLUE}{BOLD}{len(trainset)}{ENDC}{YELLOW} examples in train set * {BLUE}{BOLD}{num_batches // self.minibatch_full_eval_steps}{ENDC}{YELLOW} full evals = {BLUE}{BOLD}{estimated_task_model_calls_wo_module_calls}{ENDC}{YELLOW} task model calls{ENDC}"""
-            
+        effective_max_bootstrapped_demos = (
+            max_bootstrapped_demos if max_bootstrapped_demos is not None else self.max_bootstrapped_demos
+        )
+        effective_max_labeled_demos = (
+            max_labeled_demos if max_labeled_demos is not None else self.max_labeled_demos
+        )
 
-        user_message = textwrap.dedent(f"""\
-            {YELLOW}{BOLD}WARNING: Projected Language Model (LM) Calls{ENDC}
+        zeroshot_opt = (effective_max_bootstrapped_demos == 0) and (effective_max_labeled_demos == 0)
 
-            Please be advised that based on the parameters you have set, the maximum number of LM calls is projected as follows:
-
-            
-            {prompt_model_line}
-            {task_model_line}
-
-            {YELLOW}{BOLD}Estimated Cost Calculation:{ENDC}
-
-            {YELLOW}Total Cost = (Number of calls to task model * (Avg Input Token Length per Call * Task Model Price per Input Token + Avg Output Token Length per Call * Task Model Price per Output Token) 
-                        + (Number of calls to prompt model * (Avg Input Token Length per Call * Task Prompt Price per Input Token + Avg Output Token Length per Call * Prompt Model Price per Output Token).{ENDC}
-
-            For a preliminary estimate of potential costs, we recommend you perform your own calculations based on the task
-            and prompt models you intend to use. If the projected costs exceed your budget or expectations, you may consider:
-
-            {YELLOW}- Reducing the number of trials (`num_batches`), the size of the trainset, or the number of LM calls in your program.{ENDC}
-            {YELLOW}- Using a cheaper task model to optimize the prompt.{ENDC}""")
-
-        user_confirmation_message = textwrap.dedent(f"""\
-            To proceed with the execution of this program, please confirm by typing {BLUE}'y'{ENDC} for yes or {BLUE}'n'{ENDC} for no.
-
-            If you would like to bypass this confirmation step in future executions, set the {YELLOW}`requires_permission_to_run`{ENDC} flag to {YELLOW}`False` when calling compile.{ENDC}
-
-            {YELLOW}Awaiting your input...{ENDC}
-        """)
-
-        print(user_message)
-
-        sys.stdout.flush()  # Flush the output buffer to force the message to print
-
-        run = True
-        if requires_permission_to_run:
-            print(user_confirmation_message)
-            user_input = input("Do you wish to continue? (y/n): ").strip().lower()
-            if user_input != "y":
-                print("Compilation aborted by the user.")
-                run = False
-
-        if run:
-            if program_aware_proposer:
-                try:
-                    self.program_code_string = get_dspy_source_code(student)
-                    if self.verbose:
-                        print("SOURCE CODE:",self.program_code_string)
-                except Exception as e:
-                    print(f"Error getting source code: {e}.\n\nRunning without program aware proposer.")
-                    self.program_code_string = None
-                    program_aware_proposer = False
-            else:
-                self.program_code_string = None
-
-            # Setup our proposer 
-            proposer = GroundedProposer(
-                trainset=trainset,
-                prompt_model=self.prompt_model,
-                program_code_string=self.program_code_string,
-                view_data_batch_size=self.view_data_batch_size,
-                program_aware=program_aware_proposer,
+        # If auto is None, and num_trials is not provided (but num_candidates is), raise an error that suggests a good num_trials value
+        if self.auto is None and (self.num_candidates is not None and num_trials is None):
+            raise ValueError(
+                f"If auto is None, num_trials must also be provided. Given num_candidates={self.num_candidates}, we'd recommend setting num_trials to ~{self._set_num_trials_from_num_candidates(student, zeroshot_opt, self.num_candidates)}."
             )
 
-            # Setup logging
-            logging.basicConfig(level=logging.WARNING)
-            setup_logging(self.log_dir)
+        # If auto is None, and num_candidates or num_trials is None, raise an error
+        if self.auto is None and (self.num_candidates is None or num_trials is None):
+            raise ValueError("If auto is None, num_candidates must also be provided.")
 
-            self.wandb_run_id = os.getenv("WANDB_RUN_ID", None)
-
-            if self.wandb_run_id:
-                # Initialize wandb with the same run ID
-                wandb.init(
-                    project="prompt_optimizers",
-                    id=self.wandb_run_id,
-                    resume="must",
-                )
-
-            # Setup random seeds
-            random.seed(seed)
-            np.random.seed(seed)
-
-            # Log current file to log_dir
-            curr_file = os.path.abspath(__file__)
-            save_file_to_log_dir(curr_file, self.log_dir)
-
-            # Set up program and evaluation function
-            program = student.deepcopy()
-            evaluate = Evaluate(devset=trainset, metric=self.metric, **eval_kwargs)
-
-            # Determine the number of fewshot examples to use to generate demos for prompt
-            if max_bootstrapped_demos == 0 and max_labeled_demos == 0:
-                max_bootstrapped_demos_for_candidate_gen = BOOTSTRAPPED_FEWSHOT_EXAMPLES_IN_CONTEXT
-                max_labeled_demos_for_candidate_gen = LABELED_FEWSHOT_EXAMPLES_IN_CONTEXT
-            else:
-                max_bootstrapped_demos_for_candidate_gen = max_bootstrapped_demos
-                max_labeled_demos_for_candidate_gen = max_labeled_demos
-
-            # # Generate N few shot example sets
-            # if not demo_candidates and not instruction_candidates:
-            #     demo_candidates = create_n_fewshot_example_sets(program=program, trainset=trainset, n=self.n, hard_fewshot=hard_fewshot, metric=self.metric, teacher_settings=self.teacher_settings, max_bootstrapped_demos=max_bootstrapped_demos_for_candidate_gen, max_labeled_demos=max_labeled_demos_for_candidate_gen)
-
-            # Generate N few shot example sets
-            try:
-                demo_candidates = create_n_fewshot_demo_sets(
-                    student=program,
-                    num_candidate_sets=self.n,
-                    trainset=trainset,
-                    max_labeled_demos=max_labeled_demos_for_candidate_gen,
-                    max_bootstrapped_demos=max_bootstrapped_demos_for_candidate_gen,
-                    metric=self.metric,
-                    teacher_settings=self.teacher_settings,
-                    seed=seed,
-                    metric_threshold=self.metric_threshold,
-                )
-            except Exception as e:
-                print(f"Error generating fewshot examples: {e}")
-                print("Running without fewshot examples.")
-                demo_candidates = None
-
-            # Generate N candidate prompts
-            proposer.program_aware = program_aware_proposer
-            proposer.use_tip = True
-            proposer.use_instruct_history = False
-            proposer.set_history_randomly = False
-            instruction_candidates = proposer.propose_instructions_for_program(
-                trainset=trainset,
-                program=program,
-                demo_candidates=demo_candidates,
-                N=self.n,
-                prompt_model=self.prompt_model,
-                T=self.init_temperature,
-                trial_logs={},
+        # If auto is provided, and either num_candidates or num_trials is not None, raise an error
+        if self.auto is not None and (self.num_candidates is not None or num_trials is not None):
+            raise ValueError(
+                "If auto is not None, num_candidates and num_trials cannot be set, since they would be overridden by the auto settings. Please either set auto to None, or do not specify num_candidates and num_trials."
             )
-            for i, pred in enumerate(program.predictors()):
-                instruction_candidates[i][0] = get_signature(pred).instructions
 
-            # instruction_candidates[1][0] = "Given the question, and context, respond with the number of the document that is most relevant to answering the question in the field 'Answer' (ex. Answer: '3')."
+        # Set random seeds
+        seed = seed or self.seed
+        self._set_random_seeds(seed)
 
-            # Save the candidate instructions generated
-            if self.log_dir:
-                fp = os.path.join(self.log_dir, "instructions_to_save.pickle")
-                with open(fp, "wb") as file:
-                    pickle.dump(instruction_candidates, file)
 
-            # If we're doing zero-shot, reset demo_candidates to none
-            if max_bootstrapped_demos == 0 and max_labeled_demos == 0:
-                demo_candidates = None
+        # Set training & validation sets
+        trainset, valset = self._set_and_validate_datasets(trainset, valset)
 
-            # Initialize variables to store the best program and its score
-            best_score = float("-inf")
-            best_program = None
-            trial_logs = {}
-            total_eval_calls = 0
-            param_score_dict = defaultdict(list) # Dictionaries of paramater combinations we've tried, and their associated scores
-            fully_evaled_param_combos = {} # List of the parameter combinations we've done full evals of
+        num_instruct_candidates = (
+            self.num_instruct_candidates
+            if self.num_instruct_candidates is not None
+            else self.num_candidates
+        )
+        num_fewshot_candidates = (
+            self.num_fewshot_candidates
+            if self.num_fewshot_candidates is not None
+            else self.num_candidates
+        )
 
-            # Define our trial objective
-            def create_objective(
-                baseline_program,
+        # Set hyperparameters based on run mode (if set)
+        (
+            num_trials,
+            valset,
+            minibatch,
+            num_instruct_candidates,
+            num_fewshot_candidates,
+        ) = self._set_hyperparams_from_run_mode(
+            student,
+            num_trials,
+            minibatch,
+            zeroshot_opt,
+            valset,
+            num_instruct_candidates,
+            num_fewshot_candidates,
+        )
+
+        if self.auto:
+            self._print_auto_run_settings(
+                num_trials,
+                minibatch,
+                valset,
+                num_fewshot_candidates,
+                num_instruct_candidates,
+            )
+
+        if minibatch and minibatch_size > len(valset):
+            raise ValueError(f"Minibatch size cannot exceed the size of the valset. Valset size: {len(valset)}.")
+
+        # Initialize program and evaluator
+        program = student.deepcopy()
+        evaluate = Evaluate(
+            devset=valset,
+            metric=self.metric,
+            num_threads=self.num_threads,
+            max_errors=effective_max_errors,
+            display_table=False,
+            display_progress=True,
+            provide_traceback=provide_traceback,
+        )
+
+        with dspy.context(lm=self.task_model):
+            # Step 1: Bootstrap few-shot examples
+            demo_candidates = self._bootstrap_fewshot_examples(
+                program,
+                trainset,
+                seed,
+                teacher,
+                num_fewshot_candidates=num_fewshot_candidates,
+                max_bootstrapped_demos=effective_max_bootstrapped_demos,
+                max_labeled_demos=effective_max_labeled_demos,
+                max_errors=effective_max_errors,
+                metric_threshold=self.metric_threshold,
+            )
+
+        # Step 2: Propose instruction candidates
+        instruction_candidates = self._propose_instructions(
+            program,
+            trainset,
+            demo_candidates,
+            view_data_batch_size,
+            program_aware_proposer,
+            data_aware_proposer,
+            tip_aware_proposer,
+            fewshot_aware_proposer,
+            num_instruct_candidates=num_instruct_candidates,
+        )
+
+        # If zero-shot, discard demos
+        if zeroshot_opt:
+            demo_candidates = None
+
+        with dspy.context(lm=self.task_model):
+            # Step 3: Find optimal prompt parameters
+            best_program = self._optimize_prompt_parameters(
+                program,
                 instruction_candidates,
                 demo_candidates,
                 evaluate,
-                trainset,
-            ):
-                def objective(trial):
-                    nonlocal best_program, best_score, trial_logs, total_eval_calls  # Allow access to the outer variables
-                    
-                    # Kick off trial
-                    logging.info(f"Starting trial num: {trial.number}")
-                    trial_logs[trial.number] = {}
-
-                    # Create a new candidate program
-                    candidate_program = baseline_program.deepcopy()
-
-                    # Choose set of instructions & demos to use for each predictor
-                    chosen_params = []
-                    for i, p_new in enumerate(candidate_program.predictors()):
-
-                        # Get instruction candidates / demos for our given predictor
-                        p_instruction_candidates = instruction_candidates[i]
-                        if demo_candidates:
-                            p_demo_candidates = demo_candidates[i]
-
-                        # Suggest the index of the instruction / demo candidate to use in our trial
-                        instruction_idx = trial.suggest_categorical(
-                            f"{i}_predictor_instruction",
-                            range(len(p_instruction_candidates)),
-                        )
-                        chosen_params.append(instruction_idx)
-                        if demo_candidates:
-                            demos_idx = trial.suggest_categorical(
-                                f"{i}_predictor_demos", range(len(p_demo_candidates)),
-                            )
-                            chosen_params.append(demo_candidates)
-
-                        # Log the selected instruction / demo candidate
-                        trial_logs[trial.number][
-                            f"{i}_predictor_instruction"
-                        ] = instruction_idx
-                        if demo_candidates:
-                            trial_logs[trial.number][f"{i}_predictor_demos"] = demos_idx
-
-                        logging.info(f"instruction_idx {instruction_idx}")
-                        if demo_candidates:
-                            logging.info(f"demos_idx {demos_idx}")
-
-                        # Set the instruction
-                        selected_instruction = p_instruction_candidates[instruction_idx]
-                        updated_signature = get_signature(p_new).with_instructions(
-                            selected_instruction,
-                        )
-                        set_signature(p_new, updated_signature)
-
-                        # Set the demos
-                        if demo_candidates:
-                            p_new.demos = p_demo_candidates[demos_idx]
-
-                    # Log assembled program
-                    print("CANDIDATE PROGRAM:")
-                    print_full_program(candidate_program)
-                    print("...")
-
-                    # Save the candidate program
-                    trial_logs[trial.number]["program_path"] = save_candidate_program(
-                        candidate_program, self.log_dir, trial.number,
-                    )
-
-                    trial_logs[trial.number]["num_eval_calls"] = 0
-
-                    # Evaluate the candidate program with relevant batch size
-                    batch_size = self._get_batch_size(minibatch, trainset)
-                    score = eval_candidate_program(
-                        batch_size, trainset, candidate_program, evaluate,
-                    )
-
-                    # Print out a full trace of the program in use
-                    print("FULL TRACE")
-                    full_trace = get_task_model_history_for_full_example(
-                        candidate_program, self.task_model, trainset, evaluate,
-                    )
-                    print("...")
-
-                    # Log relevant information
-                    print(f"Score {score}")                
-                    categorical_key = ",".join(map(str, chosen_params))
-                    param_score_dict[categorical_key].append(
-                        (score, candidate_program),
-                    )
-                    trial_logs[trial.number]["num_eval_calls"] = batch_size
-                    trial_logs[trial.number]["full_eval"] = batch_size >= len(trainset)
-                    trial_logs[trial.number]["eval_example_call"] = full_trace
-                    trial_logs[trial.number]["score"] = score
-                    trial_logs[trial.number]["pruned"] = False
-                    total_eval_calls += trial_logs[trial.number]["num_eval_calls"]
-                    trial_logs[trial.number]["total_eval_calls_so_far"] = total_eval_calls
-                    trial_logs[trial.number]["program"] = candidate_program.deepcopy()
-                    if self.wandb_run_id:
-                        wandb.log(
-                            {
-                                "score": score,
-                                "num_eval_calls": trial_logs[trial.number]["num_eval_calls"],
-                                "total_eval_calls": total_eval_calls,
-                            },
-                        )
-
-                    # Update the best program if the current score is better, and if we're not using minibatching
-                    best_score_updated = False
-                    if score > best_score and trial_logs[trial.number]["full_eval"] and not minibatch:
-                        print("Updating best score")
-                        best_score = score
-                        best_program = candidate_program.deepcopy()
-                        best_score_updated = True
-                        
-
-                    # If we're doing minibatching, check to see if it's time to do a full eval
-                    if minibatch and trial.number % self.minibatch_full_eval_steps == 0:
-                        
-                        # Save old information as the minibatch version
-                        trial_logs[trial.number]["mb_score"] = score
-                        trial_logs[trial.number]["mb_program_path"] = trial_logs[trial.number]["program_path"]
-
-                        # Identify our best program (based on mean of scores so far, and do a full eval on it)
-                        highest_mean_program, combo_key = get_program_with_highest_avg_score(param_score_dict, fully_evaled_param_combos)
-                        full_train_score = eval_candidate_program(
-                            len(trainset), trainset, highest_mean_program, evaluate,
-                        )
-
-                        # Log relevant information
-                        fully_evaled_param_combos[combo_key] = {"program":highest_mean_program, "score": full_train_score}
-                        total_eval_calls += len(trainset)
-                        trial_logs[trial.number]["total_eval_calls_so_far"] = total_eval_calls
-                        trial_logs[trial.number]["full_eval"] = True
-                        trial_logs[trial.number]["program_path"] = save_candidate_program(
-                            program=highest_mean_program, log_dir=self.log_dir, trial_num=trial.number, note="full_eval",
-                        )
-                        trial_logs[trial.number]["score"] = full_train_score
-                        
-                        if full_train_score > best_score:
-                            print(f"UPDATING BEST SCORE WITH {full_train_score}")
-                            best_score = full_train_score
-                            best_program = highest_mean_program.deepcopy()
-                            best_score_updated = True
-                    
-                    # If the best score was updated, do a full eval on the dev set
-                    if best_score_updated:
-                        full_dev_score = evaluate(
-                            best_program,
-                            devset=valset,
-                            display_table=0,
-                        )
-                        if self.wandb_run_id:
-                            wandb.log(
-                                {
-                                    "best_prog_so_far_train_score": best_score,
-                                    "best_prog_so_far_dev_score": full_dev_score,
-                                },
-                            )
-
-                    return score
-
-                return objective
-
-            # Run the trial
-            objective_function = create_objective(
-                program, instruction_candidates, demo_candidates, evaluate, trainset,
+                valset,
+                num_trials,
+                minibatch,
+                minibatch_size,
+                minibatch_full_eval_steps,
+                seed,
             )
 
-            sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
-            study = optuna.create_study(direction="maximize", sampler=sampler)
-            score = study.optimize(objective_function, n_trials=num_batches)
+        return best_program
 
-            if best_program is not None and self.track_stats:
-                best_program.trial_logs = trial_logs
-                best_program.score = best_score
-                best_program.prompt_model_total_calls = self.prompt_model_total_calls
-                best_program.total_calls = self.total_calls
+    def _set_random_seeds(self, seed):
+        self.rng = random.Random(seed)
 
-            # program_file_path = os.path.join(self.log_dir, 'best_program.pickle')
-            if self.log_dir:
-                program_file_path = os.path.join(self.log_dir, "best_program")
-                best_program.save(program_file_path)
+    def _set_num_trials_from_num_candidates(self, program, zeroshot_opt, num_candidates):
+        num_vars = len(program.predictors())
+        if not zeroshot_opt:
+            num_vars *= 2  # Account for few-shot examples + instruction variables
+        # Trials = MAX(c*M*log(N), c=2, 3/2*N)
+        num_trials = int(max(2 * num_vars * math.log2(num_candidates), 1.5 * num_candidates))
 
-                optuna_study_file_path = os.path.join(self.log_dir, "optuna_study.pickle")
-                with open(optuna_study_file_path, "wb") as file:
-                    pickle.dump(study, file)
+        return num_trials
 
-            return best_program
-        return student
+    def _set_hyperparams_from_run_mode(
+        self,
+        program: Any,
+        num_trials: int | None,
+        minibatch: bool,
+        zeroshot_opt: bool,
+        valset: list,
+        num_instruct_candidates: int | None,
+        num_fewshot_candidates: int | None,
+    ) -> tuple[int, list, bool, int, int]:
+        if self.auto is None:
+            if num_instruct_candidates is None or num_fewshot_candidates is None:
+                raise ValueError("num_candidates must be provided when auto is None.")
+            return num_trials, valset, minibatch, num_instruct_candidates, num_fewshot_candidates
+
+        auto_settings = AUTO_RUN_SETTINGS[self.auto]
+
+        valset = create_minibatch(valset, batch_size=auto_settings["val_size"], rng=self.rng)
+        minibatch = len(valset) > MIN_MINIBATCH_SIZE
+
+        # Set num instruct candidates to 1/2 of N if optimizing with few-shot examples, otherwise set to N
+        # This is because we've found that it's generally better to spend optimization budget on few-shot examples
+        # When they are allowed.
+        num_instruct_candidates = auto_settings["n"] if zeroshot_opt else int(auto_settings["n"] * 0.5)
+        num_fewshot_candidates = auto_settings["n"]
+
+        num_trials = self._set_num_trials_from_num_candidates(program, zeroshot_opt, auto_settings["n"])
+
+        return num_trials, valset, minibatch, num_instruct_candidates, num_fewshot_candidates
+
+    def _set_and_validate_datasets(self, trainset: list, valset: list | None):
+        if not trainset:
+            raise ValueError("Trainset cannot be empty.")
+
+        if valset is None:
+            if len(trainset) < 2:
+                raise ValueError("Trainset must have at least 2 examples if no valset specified.")
+            valset_size = min(1000, max(1, int(len(trainset) * 0.80)))
+            cutoff = len(trainset) - valset_size
+            valset = trainset[cutoff:]
+            trainset = trainset[:cutoff]
+        else:
+            if len(valset) < 1:
+                raise ValueError("Validation set must have at least 1 example.")
+
+        return trainset, valset
+
+    def _print_auto_run_settings(
+        self,
+        num_trials: int,
+        minibatch: bool,
+        valset: list,
+        num_fewshot_candidates: int,
+        num_instruct_candidates: int,
+    ):
+        logger.info(
+            f"\nRUNNING WITH THE FOLLOWING {self.auto.upper()} AUTO RUN SETTINGS:"
+            f"\nnum_trials: {num_trials}"
+            f"\nminibatch: {minibatch}"
+            f"\nnum_fewshot_candidates: {num_fewshot_candidates}"
+            f"\nnum_instruct_candidates: {num_instruct_candidates}"
+            f"\nvalset size: {len(valset)}\n"
+        )
+
+    def _estimate_lm_calls(
+        self,
+        program: Any,
+        num_trials: int,
+        minibatch: bool,
+        minibatch_size: int,
+        minibatch_full_eval_steps: int,
+        valset: list,
+        program_aware_proposer: bool,
+        num_instruct_candidates: int,
+    ) -> tuple[str, str]:
+        num_predictors = len(program.predictors())
+
+        # Estimate prompt model calls
+        estimated_prompt_model_calls = (
+            10  # Data summarizer calls
+            + num_instruct_candidates * num_predictors  # Candidate generation
+            + (num_predictors + 1 if program_aware_proposer else 0)  # Program-aware proposer
+        )
+        prompt_model_line = (
+            f"{YELLOW}- Prompt Generation: {BLUE}{BOLD}10{ENDC}{YELLOW} data summarizer calls + "
+            f"{BLUE}{BOLD}{num_instruct_candidates}{ENDC}{YELLOW} * "
+            f"{BLUE}{BOLD}{num_predictors}{ENDC}{YELLOW} lm calls in program "
+            f"+ ({BLUE}{BOLD}{num_predictors + 1}{ENDC}{YELLOW}) lm calls in program-aware proposer "
+            f"= {BLUE}{BOLD}{estimated_prompt_model_calls}{ENDC}{YELLOW} prompt model calls{ENDC}"
+        )
+
+        # Estimate task model calls
+        if not minibatch:
+            estimated_task_model_calls = len(valset) * num_trials
+            task_model_line = (
+                f"{YELLOW}- Program Evaluation: {BLUE}{BOLD}{len(valset)}{ENDC}{YELLOW} examples in val set * "
+                f"{BLUE}{BOLD}{num_trials}{ENDC}{YELLOW} batches = "
+                f"{BLUE}{BOLD}{estimated_task_model_calls}{ENDC}{YELLOW} LM program calls{ENDC}"
+            )
+        else:
+            full_eval_steps = num_trials // minibatch_full_eval_steps + 1
+            estimated_task_model_calls = minibatch_size * num_trials + len(valset) * full_eval_steps
+            task_model_line = (
+                f"{YELLOW}- Program Evaluation: {BLUE}{BOLD}{minibatch_size}{ENDC}{YELLOW} examples in minibatch * "
+                f"{BLUE}{BOLD}{num_trials}{ENDC}{YELLOW} batches + "
+                f"{BLUE}{BOLD}{len(valset)}{ENDC}{YELLOW} examples in val set * "
+                f"{BLUE}{BOLD}{full_eval_steps}{ENDC}{YELLOW} full evals = "
+                f"{BLUE}{BOLD}{estimated_task_model_calls}{ENDC}{YELLOW} LM Program calls{ENDC}"
+            )
+
+        return prompt_model_line, task_model_line
+
+    def _bootstrap_fewshot_examples(
+        self,
+        program: Any,
+        trainset: list,
+        seed: int,
+        teacher: Any,
+        *,
+        num_fewshot_candidates: int,
+        max_bootstrapped_demos: int,
+        max_labeled_demos: int,
+        max_errors: int | None,
+        metric_threshold: float | None,
+    ) -> list | None:
+        logger.info("\n==> STEP 1: BOOTSTRAP FEWSHOT EXAMPLES <==")
+        if max_bootstrapped_demos > 0:
+            logger.info(
+                "These will be used as few-shot example candidates for our program and for creating instructions.\n"
+            )
+        else:
+            logger.info("These will be used for informing instruction proposal.\n")
+
+        logger.info(f"Bootstrapping N={num_fewshot_candidates} sets of demonstrations...")
+
+        zeroshot = max_bootstrapped_demos == 0 and max_labeled_demos == 0
+
+        if max_errors is None:
+            max_errors = dspy.settings.max_errors
+
+        demo_candidates = create_n_fewshot_demo_sets(
+            student=program,
+            num_candidate_sets=num_fewshot_candidates,
+            trainset=trainset,
+            max_labeled_demos=(LABELED_FEWSHOT_EXAMPLES_IN_CONTEXT if zeroshot else max_labeled_demos),
+            max_bootstrapped_demos=(
+                BOOTSTRAPPED_FEWSHOT_EXAMPLES_IN_CONTEXT if zeroshot else max_bootstrapped_demos
+            ),
+            metric=self.metric,
+            max_errors=max_errors,
+            teacher=teacher,
+            teacher_settings=self.teacher_settings,
+            seed=seed,
+            metric_threshold=metric_threshold,
+            rng=self.rng,
+        )
+        # NOTE: Bootstrapping is essential to MIPRO!
+        # Failing silently here makes the rest of the optimization far weaker as a result!
+        # except Exception as e:
+        #     logger.info(f"!!!!\n\n\n\n\nError generating few-shot examples: {e}")
+        #     logger.info("Running without few-shot examples.!!!!\n\n\n\n\n")
+        #     demo_candidates = None
+
+        return demo_candidates
+
+    def _propose_instructions(
+        self,
+        program: Any,
+        trainset: list,
+        demo_candidates: list | None,
+        view_data_batch_size: int,
+        program_aware_proposer: bool,
+        data_aware_proposer: bool,
+        tip_aware_proposer: bool,
+        fewshot_aware_proposer: bool,
+        num_instruct_candidates: int,
+    ) -> dict[int, list[str]]:
+        logger.info("\n==> STEP 2: PROPOSE INSTRUCTION CANDIDATES <==")
+        logger.info(
+            "We will use the few-shot examples from the previous step, a generated dataset summary, a summary of the program code, and a randomly selected prompting tip to propose instructions."
+        )
+
+        proposer = GroundedProposer(
+            program=program,
+            trainset=trainset,
+            prompt_model=self.prompt_model,
+            view_data_batch_size=view_data_batch_size,
+            program_aware=program_aware_proposer,
+            use_dataset_summary=data_aware_proposer,
+            use_task_demos=fewshot_aware_proposer,
+            num_demos_in_context=BOOTSTRAPPED_FEWSHOT_EXAMPLES_IN_CONTEXT,
+            use_tip=tip_aware_proposer,
+            set_tip_randomly=tip_aware_proposer,
+            use_instruct_history=False,
+            set_history_randomly=False,
+            verbose=self.verbose,
+            rng=self.rng,
+            init_temperature=self.init_temperature,
+        )
+
+        logger.info(f"\nProposing N={num_instruct_candidates} instructions...\n")
+        instruction_candidates = proposer.propose_instructions_for_program(
+            trainset=trainset,
+            program=program,
+            demo_candidates=demo_candidates,
+            N=num_instruct_candidates,
+            trial_logs={},
+        )
+
+        for i, pred in enumerate(program.predictors()):
+            logger.info(f"Proposed Instructions for Predictor {i}:\n")
+            instruction_candidates[i][0] = get_signature(pred).instructions
+            for j, instruction in enumerate(instruction_candidates[i]):
+                logger.info(f"{j}: {instruction}\n")
+            logger.info("\n")
+
+        return instruction_candidates
+
+    def _optimize_prompt_parameters(
+        self,
+        program: Any,
+        instruction_candidates: dict[int, list[str]],
+        demo_candidates: list | None,
+        evaluate: Evaluate,
+        valset: list,
+        num_trials: int,
+        minibatch: bool,
+        minibatch_size: int,
+        minibatch_full_eval_steps: int,
+        seed: int,
+    ) -> Any | None:
+        optuna = _import_optuna()
+
+        # Run optimization
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        logger.info("==> STEP 3: FINDING OPTIMAL PROMPT PARAMETERS <==")
+        logger.info(
+            "We will evaluate the program over a series of trials with different combinations of instructions and few-shot examples to find the optimal combination using Bayesian Optimization.\n"
+        )
+
+        # Compute the adjusted total trials that we will run (including full evals)
+        run_additional_full_eval_at_end = 1 if num_trials % minibatch_full_eval_steps != 0 else 0
+        adjusted_num_trials = int(
+            (num_trials + num_trials // minibatch_full_eval_steps + 1 + run_additional_full_eval_at_end)
+            if minibatch
+            else num_trials
+        )
+        logger.info(f"== Trial {1} / {adjusted_num_trials} - Full Evaluation of Default Program ==")
+
+        default_score = eval_candidate_program(len(valset), valset, program, evaluate, self.rng).score
+        logger.info(f"Default program score: {default_score}\n")
+
+        trial_logs = {}
+        trial_logs[1] = {}
+        trial_logs[1]["full_eval_program_path"] = save_candidate_program(program, self.log_dir, -1)
+        trial_logs[1]["full_eval_score"] = default_score
+        trial_logs[1]["total_eval_calls_so_far"] = len(valset)
+        trial_logs[1]["full_eval_program"] = program.deepcopy()
+
+        # Initialize optimization variables
+        best_score = default_score
+        best_program = program.deepcopy()
+        total_eval_calls = len(valset)
+        score_data = [{"score": best_score, "program": program.deepcopy(), "full_eval": True}]
+        param_score_dict = defaultdict(list)
+        fully_evaled_param_combos = {}
+
+        # Define the objective function
+        def objective(trial):
+            nonlocal program, best_program, best_score, trial_logs, total_eval_calls, score_data
+
+            trial_num = trial.number + 1
+            if minibatch:
+                logger.info(f"== Trial {trial_num} / {adjusted_num_trials} - Minibatch ==")
+            else:
+                logger.info(f"===== Trial {trial_num} / {num_trials} =====")
+
+            trial_logs[trial_num] = {}
+
+            # Create a new candidate program
+            candidate_program = program.deepcopy()
+
+            # Choose instructions and demos, insert them into the program
+            chosen_params, raw_chosen_params = self._select_and_insert_instructions_and_demos(
+                candidate_program,
+                instruction_candidates,
+                demo_candidates,
+                trial,
+                trial_logs,
+                trial_num,
+            )
+
+            # Log assembled program
+            if self.verbose:
+                logger.info("Evaluating the following candidate program...\n")
+                print_full_program(candidate_program)
+
+            # Evaluate the candidate program (on minibatch if minibatch=True)
+            batch_size = minibatch_size if minibatch else len(valset)
+            score = eval_candidate_program(batch_size, valset, candidate_program, evaluate, self.rng).score
+            total_eval_calls += batch_size
+
+            # Update best score and program
+            if not minibatch and score > best_score:
+                best_score = score
+                best_program = candidate_program.deepcopy()
+                logger.info(f"{GREEN}Best full score so far!{ENDC} Score: {score}")
+
+            # Log evaluation results
+            score_data.append(
+                {"score": score, "program": candidate_program, "full_eval": batch_size >= len(valset)}
+            )  # score, prog, full_eval
+            if minibatch:
+                self._log_minibatch_eval(
+                    score,
+                    best_score,
+                    batch_size,
+                    chosen_params,
+                    score_data,
+                    trial,
+                    adjusted_num_trials,
+                    trial_logs,
+                    trial_num,
+                    candidate_program,
+                    total_eval_calls,
+                )
+            else:
+                self._log_normal_eval(
+                    score,
+                    best_score,
+                    chosen_params,
+                    score_data,
+                    trial,
+                    num_trials,
+                    trial_logs,
+                    trial_num,
+                    valset,
+                    batch_size,
+                    candidate_program,
+                    total_eval_calls,
+                )
+            categorical_key = ",".join(map(str, chosen_params))
+            param_score_dict[categorical_key].append(
+                (score, candidate_program, raw_chosen_params),
+            )
+
+            # If minibatch, perform full evaluation at intervals (and at the very end)
+            if minibatch and (
+                (trial_num % (minibatch_full_eval_steps + 1) == 0) or (trial_num == (adjusted_num_trials - 1))
+            ):
+                best_score, best_program, total_eval_calls = self._perform_full_evaluation(
+                    trial_num,
+                    adjusted_num_trials,
+                    param_score_dict,
+                    fully_evaled_param_combos,
+                    evaluate,
+                    valset,
+                    trial_logs,
+                    total_eval_calls,
+                    score_data,
+                    best_score,
+                    best_program,
+                    study,
+                    instruction_candidates,
+                    demo_candidates,
+                )
+
+            return score
+
+        sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        default_params = {f"{i}_predictor_instruction": 0 for i in range(len(program.predictors()))}
+        if demo_candidates:
+            default_params.update({f"{i}_predictor_demos": 0 for i in range(len(program.predictors()))})
+
+        # Add default run as a baseline in optuna (TODO: figure out how to weight this by # of samples evaluated on)
+        trial = optuna.trial.create_trial(
+            params=default_params,
+            distributions=self._get_param_distributions(program, instruction_candidates, demo_candidates),
+            value=default_score,
+        )
+        study.add_trial(trial)
+        study.optimize(objective, n_trials=num_trials)
+
+        # Attach logs to best program
+        if best_program is not None and self.track_stats:
+            best_program.trial_logs = trial_logs
+            best_program.score = best_score
+            best_program.prompt_model_total_calls = self.prompt_model_total_calls
+            best_program.total_calls = self.total_calls
+            sorted_candidate_programs = sorted(score_data, key=lambda x: x["score"], reverse=True)
+            # Attach all minibatch programs
+            best_program.mb_candidate_programs = [
+                score_data for score_data in sorted_candidate_programs if not score_data["full_eval"]
+            ]
+            # Attach all programs that were evaluated on the full trainset, in descending order of score
+            best_program.candidate_programs = [
+                score_data for score_data in sorted_candidate_programs if score_data["full_eval"]
+            ]
+
+        logger.info(f"Returning best identified program with score {best_score}!")
+
+        return best_program
+
+    def _log_minibatch_eval(
+        self,
+        score,
+        best_score,
+        batch_size,
+        chosen_params,
+        score_data,
+        trial,
+        adjusted_num_trials,
+        trial_logs,
+        trial_num,
+        candidate_program,
+        total_eval_calls,
+    ):
+        trial_logs[trial_num]["mb_program_path"] = save_candidate_program(candidate_program, self.log_dir, trial_num)
+        trial_logs[trial_num]["mb_score"] = score
+        trial_logs[trial_num]["total_eval_calls_so_far"] = total_eval_calls
+        trial_logs[trial_num]["mb_program"] = candidate_program.deepcopy()
+
+        logger.info(f"Score: {score} on minibatch of size {batch_size} with parameters {chosen_params}.")
+        minibatch_scores = ", ".join([f"{s['score']}" for s in score_data if not s["full_eval"]])
+        logger.info(f"Minibatch scores so far: {'[' + minibatch_scores + ']'}")
+        full_eval_scores = ", ".join([f"{s['score']}" for s in score_data if s["full_eval"]])
+        trajectory = "[" + full_eval_scores + "]"
+        logger.info(f"Full eval scores so far: {trajectory}")
+        logger.info(f"Best full score so far: {best_score}")
+        logger.info(
+            f"{'=' * len(f'== Trial {trial.number + 1} / {adjusted_num_trials} - Minibatch Evaluation ==')}\n\n"
+        )
+
+    def _log_normal_eval(
+        self,
+        score,
+        best_score,
+        chosen_params,
+        score_data,
+        trial,
+        num_trials,
+        trial_logs,
+        trial_num,
+        valset,
+        batch_size,
+        candidate_program,
+        total_eval_calls,
+    ):
+        trial_logs[trial_num]["full_eval_program_path"] = save_candidate_program(
+            candidate_program, self.log_dir, trial_num
+        )
+        trial_logs[trial_num]["full_eval_score"] = score
+        trial_logs[trial_num]["total_eval_calls_so_far"] = total_eval_calls
+        trial_logs[trial_num]["full_eval_program"] = candidate_program.deepcopy()
+
+        logger.info(f"Score: {score} with parameters {chosen_params}.")
+        full_eval_scores = ", ".join([f"{s['score']}" for s in score_data if s["full_eval"]])
+        logger.info(f"Scores so far: {'[' + full_eval_scores + ']'}")
+        logger.info(f"Best score so far: {best_score}")
+        logger.info(f"{'=' * len(f'===== Trial {trial.number + 1} / {num_trials} =====')}\n\n")
+
+    def _select_and_insert_instructions_and_demos(
+        self,
+        candidate_program: Any,
+        instruction_candidates: dict[int, list[str]],
+        demo_candidates: list | None,
+        trial: "optuna.trial.Trial",
+        trial_logs: dict,
+        trial_num: int,
+    ) -> list[str]:
+        chosen_params = []
+        raw_chosen_params = {}
+
+        for i, predictor in enumerate(candidate_program.predictors()):
+            # Select instruction
+            instruction_idx = trial.suggest_categorical(
+                f"{i}_predictor_instruction", range(len(instruction_candidates[i]))
+            )
+            selected_instruction = instruction_candidates[i][instruction_idx]
+            updated_signature = get_signature(predictor).with_instructions(selected_instruction)
+            set_signature(predictor, updated_signature)
+            trial_logs[trial_num][f"{i}_predictor_instruction"] = instruction_idx
+            chosen_params.append(f"Predictor {i}: Instruction {instruction_idx}")
+            raw_chosen_params[f"{i}_predictor_instruction"] = instruction_idx
+            # Select demos if available
+            if demo_candidates:
+                demos_idx = trial.suggest_categorical(f"{i}_predictor_demos", range(len(demo_candidates[i])))
+                predictor.demos = demo_candidates[i][demos_idx]
+                trial_logs[trial_num][f"{i}_predictor_demos"] = demos_idx
+                chosen_params.append(f"Predictor {i}: Few-Shot Set {demos_idx}")
+                raw_chosen_params[f"{i}_predictor_demos"] = demos_idx
+
+        return chosen_params, raw_chosen_params
+
+    def _get_param_distributions(self, program, instruction_candidates, demo_candidates):
+        optuna = _import_optuna()
+        CategoricalDistribution = optuna.distributions.CategoricalDistribution
+
+        param_distributions = {}
+
+        for i in range(len(instruction_candidates)):
+            param_distributions[f"{i}_predictor_instruction"] = CategoricalDistribution(
+                range(len(instruction_candidates[i]))
+            )
+            if demo_candidates:
+                param_distributions[f"{i}_predictor_demos"] = CategoricalDistribution(range(len(demo_candidates[i])))
+
+        return param_distributions
+
+    def _perform_full_evaluation(
+        self,
+        trial_num: int,
+        adjusted_num_trials: int,
+        param_score_dict: dict,
+        fully_evaled_param_combos: dict,
+        evaluate: Evaluate,
+        valset: list,
+        trial_logs: dict,
+        total_eval_calls: int,
+        score_data,
+        best_score: float,
+        best_program: Any,
+        study: "optuna.Study",
+        instruction_candidates: list,
+        demo_candidates: list,
+    ):
+        optuna = _import_optuna()
+
+        logger.info(f"===== Trial {trial_num + 1} / {adjusted_num_trials} - Full Evaluation =====")
+
+        # Identify best program to evaluate fully
+        highest_mean_program, mean_score, combo_key, params = get_program_with_highest_avg_score(
+            param_score_dict, fully_evaled_param_combos
+        )
+        logger.info(f"Doing full eval on next top averaging program (Avg Score: {mean_score}) from minibatch trials...")
+        full_eval_score = eval_candidate_program(len(valset), valset, highest_mean_program, evaluate, self.rng).score
+        score_data.append({"score": full_eval_score, "program": highest_mean_program, "full_eval": True})
+
+        # Log full eval as a trial so that optuna can learn from the new results
+        trial = optuna.trial.create_trial(
+            params=params,
+            distributions=self._get_param_distributions(best_program, instruction_candidates, demo_candidates),
+            value=full_eval_score,
+        )
+        study.add_trial(trial)
+
+        # Log full evaluation results
+        fully_evaled_param_combos[combo_key] = {
+            "program": highest_mean_program,
+            "score": full_eval_score,
+        }
+        total_eval_calls += len(valset)
+        trial_logs[trial_num + 1] = {}
+        trial_logs[trial_num + 1]["total_eval_calls_so_far"] = total_eval_calls
+        trial_logs[trial_num + 1]["full_eval_program_path"] = save_candidate_program(
+            program=highest_mean_program,
+            log_dir=self.log_dir,
+            trial_num=trial_num + 1,
+            note="full_eval",
+        )
+        trial_logs[trial_num + 1]["full_eval_program"] = highest_mean_program
+        trial_logs[trial_num + 1]["full_eval_score"] = full_eval_score
+
+        # Update best score and program if necessary
+        if full_eval_score > best_score:
+            logger.info(f"{GREEN}New best full eval score!{ENDC} Score: {full_eval_score}")
+            best_score = full_eval_score
+            best_program = highest_mean_program.deepcopy()
+        full_eval_scores = ", ".join([f"{s['score']}" for s in score_data if s["full_eval"]])
+        trajectory = "[" + full_eval_scores + "]"
+        logger.info(f"Full eval scores so far: {trajectory}")
+        logger.info(f"Best full score so far: {best_score}")
+        logger.info(len(f"===== Full Eval {len(fully_evaled_param_combos) + 1} =====") * "=")
+        logger.info("\n")
+
+        return best_score, best_program, total_eval_calls

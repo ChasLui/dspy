@@ -1,4 +1,7 @@
-from module_graph import *
+from dspy.adapters.types.citation import Citations
+from dspy.adapters.types.document import Document
 
-from .synthesizer import *
-from .synthetic_data import *
+__all__ = [
+    "Citations",
+    "Document",
+]

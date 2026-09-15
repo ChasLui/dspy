@@ -1,25 +1,24 @@
 import pytest
-import dsp, dspy
+
+import dspy
 from dspy.teleprompt.knn_fewshot import KNNFewShot
 from dspy.utils.dummies import DummyLM, DummyVectorizer
 
 
-def mock_example(question: str, answer: str) -> dsp.Example:
+def mock_example(question: str, answer: str) -> dspy.Example:
     """Creates a mock DSP example with specified question and answer."""
     return dspy.Example(question=question, answer=answer).with_inputs("question")
 
 
 @pytest.fixture
-def setup_knn_few_shot():
+def setup_knn_few_shot() -> KNNFewShot:
     """Sets up a KNNFewShot instance for testing."""
     trainset = [
         mock_example("What is the capital of France?", "Paris"),
         mock_example("What is the largest ocean?", "Pacific"),
         mock_example("What is 2+2?", "4"),
     ]
-    dsp.SentenceTransformersVectorizer = DummyVectorizer
-    knn_few_shot = KNNFewShot(k=2, trainset=trainset)
-    return knn_few_shot
+    return KNNFewShot(k=2, trainset=trainset, vectorizer=dspy.Embedder(DummyVectorizer()))
 
 
 def test_knn_few_shot_initialization(setup_knn_few_shot):
@@ -50,7 +49,7 @@ def _test_knn_few_shot_compile(setup_knn_few_shot):
 
     # Setup DummyLM with a response for a query similar to one of the training examples
     lm = DummyLM(["Madrid", "10"])
-    dspy.settings.configure(lm=lm)  # Responses for the capital of Spain and the result of 5+5)
+    dspy.configure(lm=lm)  # Responses for the capital of Spain and the result of 5+5)
 
     knn_few_shot = setup_knn_few_shot
     trainset = knn_few_shot.KNN.trainset
@@ -61,9 +60,6 @@ def _test_knn_few_shot_compile(setup_knn_few_shot):
     assert compiled_student.predictor.demos[0].output == trainset[0].output
     # Simulate a query that is similar to one of the training examples
     output = compiled_student.forward(input="What is the capital of Spain?").output
-
-    print("CONVO")
-    print(lm.get_convo(-1))
 
     # Validate that the output corresponds to one of the expected DummyLM responses
     # This assumes the compiled_student's forward method will execute the predictor with the given query

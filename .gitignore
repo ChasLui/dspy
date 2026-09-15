@@ -14,6 +14,8 @@
 /examples/nli/scone/compiled_program.dspy
 /examples/qa/hotpot/compiled_program.dspy
 /ScoNe/
+testing/outputs/
+testing/playbook.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -37,7 +39,6 @@ __pycache__/
 gpt*.txt
 *.env
 local/
-local_*
 build/
 *.egg-info/
 # *.jsonl
@@ -56,3 +57,12 @@ assertion.log
 /.devcontainer/.personalization.sh
 
 .mypy_cache
+CLAUDE.local.md
+dummy.csv
+docs/docs/**/*.json*
+*.index
+*.pkl
+*.tar.gz
+
+test_before_pypi/
+.github/.internal_dspyai/dist/

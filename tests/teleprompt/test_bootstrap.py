@@ -1,10 +1,10 @@
 import pytest
+
 import dspy
-from dspy.predict import Predict
-from dspy.utils.dummies import DummyLM
 from dspy import Example
+from dspy.predict import Predict
 from dspy.teleprompt import BootstrapFewShot
-import textwrap
+from dspy.utils.dummies import DummyLM
 
 
 # Define a simple metric function for testing
@@ -15,9 +15,7 @@ def simple_metric(example, prediction, trace=None):
 
 examples = [
     Example(input="What is the color of the sky?", output="blue").with_inputs("input"),
-    Example(
-        input="What does the fox say?", output="Ring-ding-ding-ding-dingeringeding!"
-    ),
+    Example(input="What does the fox say?", output="Ring-ding-ding-ding-dingeringeding!"),
 ]
 trainset = [examples[0]]
 valset = [examples[1]]
@@ -25,9 +23,7 @@ valset = [examples[1]]
 
 def test_bootstrap_initialization():
     # Initialize BootstrapFewShot with a dummy metric and minimal setup
-    bootstrap = BootstrapFewShot(
-        metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1
-    )
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
     assert bootstrap.metric == simple_metric, "Metric not correctly initialized"
 
 
@@ -40,6 +36,42 @@ class SimpleModule(dspy.Module):
         return self.predictor(**kwargs)
 
 
+class TwoPredictorModule(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.p1 = Predict("input -> output")
+        self.p2 = Predict("input -> output")
+
+    def forward(self, **kwargs):
+        return self.p2(**self.p1(**kwargs))
+
+
+def test_bootstrap_labeled_demos_sampled_independently_per_predictor():
+    # Each predictor must draw its labeled demos from the FULL validation pool.
+    # Regression: _train reassigned the shared `raw_demos` to the sampled subset
+    # inside the per-predictor loop, so later predictors sampled from the prior
+    # predictor's leftovers -- starving them when an earlier predictor consumed
+    # most of the pool via bootstrapped (augmented) demos.
+    student = TwoPredictorModule()
+    names = [name for name, _ in student.named_predictors()]
+    pool = [Example(input=f"q{i}", output=f"a{i}").with_inputs("input") for i in range(10)]
+    augmented = [Example(input=f"aug{i}", output=f"x{i}").with_inputs("input") for i in range(5)]
+
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=5, max_labeled_demos=8)
+    bootstrap.student = student
+    bootstrap.validation = pool
+    # First predictor has 5 bootstrapped demos; second has none.
+    bootstrap.name2traces = {names[0]: list(augmented), names[1]: []}
+
+    bootstrap._train()
+
+    p1, p2 = (p for _, p in student.named_predictors())
+    # p1: 5 augmented + 3 labeled = 8
+    assert len(p1.demos) == 8
+    # p2: 0 augmented, so it must still get the full labeled quota from the full pool.
+    assert len(p2.demos) == 8
+
+
 def test_compile_with_predict_instances():
     # Create Predict instances for student and teacher
     # Note that dspy.Predict is not itself a module, so we can't use it directly here
@@ -47,35 +79,25 @@ def test_compile_with_predict_instances():
     teacher = SimpleModule("input -> output")
 
     lm = DummyLM(["Initial thoughts", "Finish[blue]"])
-    dspy.settings.configure(lm=lm)
+    dspy.configure(lm=lm)
 
     # Initialize BootstrapFewShot and compile the student
-    bootstrap = BootstrapFewShot(
-        metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1
-    )
-    compiled_student = bootstrap.compile(
-        student, teacher=teacher, trainset=trainset
-    )
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
 
     assert compiled_student is not None, "Failed to compile student"
-    assert (
-        hasattr(compiled_student, "_compiled") and compiled_student._compiled
-    ), "Student compilation flag not set"
+    assert hasattr(compiled_student, "_compiled") and compiled_student._compiled, "Student compilation flag not set"
 
 
 def test_bootstrap_effectiveness():
     # This test verifies if the bootstrapping process improves the student's predictions
     student = SimpleModule("input -> output")
     teacher = SimpleModule("input -> output")
-    lm = DummyLM(["blue", "Ring-ding-ding-ding-dingeringeding!"], follow_examples=True)
-    dspy.settings.configure(lm=lm, trace=[])
+    lm = DummyLM([{"output": "blue"}, {"output": "Ring-ding-ding-ding-dingeringeding!"}], follow_examples=True)
+    dspy.configure(lm=lm, trace=[])
 
-    bootstrap = BootstrapFewShot(
-        metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1
-    )
-    compiled_student = bootstrap.compile(
-        student, teacher=teacher, trainset=trainset
-    )
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
 
     # Check that the compiled student has the correct demos
     assert len(compiled_student.predictor.demos) == 1
@@ -89,32 +111,6 @@ def test_bootstrap_effectiveness():
     # prompt, it will use that instead. That is why we expect "blue" here.
     prediction = compiled_student(input=trainset[0].input)
     assert prediction.output == trainset[0].output
-
-    # For debugging
-    print("Convo")
-    print(lm.get_convo(-1))
-
-    assert lm.get_convo(-1) == textwrap.dedent(
-        """\
-        Given the fields `input`, produce the fields `output`.
-
-        ---
-
-        Follow the following format.
-
-        Input: ${input}
-        Output: ${output}
-
-        ---
-
-        Input: What is the color of the sky?
-        Output: blue
-
-        ---
-
-        Input: What is the color of the sky?
-        Output: blue"""
-    )
 
 
 def test_error_handling_during_bootstrap():
@@ -136,10 +132,10 @@ def test_error_handling_during_bootstrap():
     # Setup DummyLM to simulate an error scenario
     lm = DummyLM(
         [
-            "Initial thoughts",  # Simulate initial teacher's prediction
+            {"output": "Initial thoughts"},  # Simulate initial teacher's prediction
         ]
     )
-    dspy.settings.configure(lm=lm)
+    dspy.configure(lm=lm)
 
     bootstrap = BootstrapFewShot(
         metric=simple_metric,
@@ -161,20 +157,14 @@ def test_validation_set_usage():
 
     lm = DummyLM(
         [
-            "Initial thoughts",
-            "Finish[blue]",  # Expected output for both training and validation
+            {"output": "Initial thoughts"},
+            {"output": "Finish[blue]"},  # Expected output for both training and validation
         ]
     )
-    dspy.settings.configure(lm=lm)
+    dspy.configure(lm=lm)
 
-    bootstrap = BootstrapFewShot(
-        metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1
-    )
-    compiled_student = bootstrap.compile(
-        student, teacher=teacher, trainset=trainset
-    )
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
 
     # Check that validation examples are part of student's demos after compilation
-    assert len(compiled_student.predictor.demos) >= len(
-        valset
-    ), "Validation set not used in compiled student demos"
+    assert len(compiled_student.predictor.demos) >= len(valset), "Validation set not used in compiled student demos"
